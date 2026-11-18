@@ -1,0 +1,31 @@
+--- a/ami9000/libretro/e9k_debug.c	2026-10-13 19:21:18.729788901 +0300
++++ b/ami9000/libretro/e9k_debug.c	2026-10-15 22:34:05.170238515 +0300
+@@ -1101,6 +1101,28 @@
+ 	return count;
+ }
+ 
++/* Write a 68000 register: 0-7 D0-D7, 8-15 A0-A7, 16 SR, 17 PC. Used by host scripts
++ * that emulate or patch code from a hook. */
++E9K_DEBUG_EXPORT int
++e9k_debug_write_reg(uint32_t index, uint32_t value)
++{
++	if (index < 16) {
++		regs.regs[index] = value;
++		return 1;
++	}
++	if (index == 16) {
++		regs.sr = (uae_u16)value;
++		MakeFromSR();
++		return 1;
++	}
++	if (index == 17) {
++		m68k_setpc((uaecptr)(value & 0x00ffffffu));
++		fill_prefetch();
++		return 1;
++	}
++	return 0;
++}
++
+ static void
+ e9k_debug_setProcessorReg(e9k_debug_processor_reg_t *reg, const char *name, uint64_t value, uint8_t bits)
+ {

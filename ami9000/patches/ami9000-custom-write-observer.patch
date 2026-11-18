@@ -1,0 +1,45 @@
+--- a/ami9000/libretro/e9k_debug.h
++++ b/ami9000/libretro/e9k_debug.h
+@@ -277,3 +277,8 @@
+ void
+ e9k_debug_checkpoint_set_name_from_pointer(uint8_t index, uint32_t ptrValue);
+ #endif
++
++/* Read-only host observation at the custom write, without pausing guest execution. */
++void e9k_debug_set_custom_write_observer(void (*observer)(uint32_t, uint32_t, uint32_t, uint32_t));
++void e9k_debug_observeCustomWrite(uint32_t address, uint32_t value, uint32_t source, uint32_t copper);
++uint32_t e9k_debug_amiga_get_dmacon(void);
+--- a/ami9000/libretro/e9k_debug.c
++++ b/ami9000/libretro/e9k_debug.c
+@@ -3156,3 +3156,18 @@
+ {
+ 	return (const e9k_debug_ami_custom_reg_state_t *)custom_storage;
+ }
++
++static void (*e9k_debug_customWriteObserver)(uint32_t, uint32_t, uint32_t, uint32_t);
++E9K_DEBUG_EXPORT void e9k_debug_set_custom_write_observer(void (*observer)(uint32_t, uint32_t, uint32_t, uint32_t))
++{
++    e9k_debug_customWriteObserver = observer;
++}
++void e9k_debug_observeCustomWrite(uint32_t address, uint32_t value, uint32_t source, uint32_t copper)
++{
++    if (e9k_debug_customWriteObserver)
++        e9k_debug_customWriteObserver(address, value, source, copper);
++}
++E9K_DEBUG_EXPORT uint32_t e9k_debug_amiga_get_dmacon(void)
++{
++    return (uint32_t)dmacon;
++}
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16029,6 +16029,10 @@
+ 	value &= 0xffff;
+ 	custom_storage[addr >> 1].value = (uae_u16)value;
+ 	custom_storage[addr >> 1].pc = copper_access ? copper_source_pc | 1 : M68K_GETPC;
++#if E9K_HACK_DEBUGGER_RUNTIME
++    e9k_debug_observeCustomWrite(0xdff000u | addr, value,
++        custom_storage[addr >> 1].pc & ~1u, copper_access ? 1u : 0u);
++#endif
+ #if E9K_DEBUGGER_CUSTOM_LOGGER
+ 	if (custom_customLoggerEnabled) {
+ 		e9k_debug_amiga_customLogWrite(vpos,

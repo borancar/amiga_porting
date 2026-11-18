@@ -1,0 +1,8 @@
+ami9000-bounded-bus-log.patch
+ami9000-custom-write-observer.patch
+ami9000-hooks.patch
+ami9000-irq-provenance.patch
+ami9000-pot-state-observer.patch
+ami9000-preserve-snapshot-boundary.patch
+ami9000-translated-cpu-devices.patch
+ami9000-write-reg.patch

@@ -1,0 +1,63 @@
+--- a/ami9000/sources/src/inputdevice.c
++++ b/ami9000/sources/src/inputdevice.c
+@@ -3805,0 +3806,60 @@
++}
++
++/* Diagnostic observer only: no POTGOR/cap_check call and no device mutation.
++ * ABI 1: 40 host-endian u32 words; caller owns storage. Read while paused.
++ * Header: version, POTGO latch, mouse pullup, NTSC.
++ * Each port (18 words): caps[2], counters[2], phases[2], analog[2],
++ * digital[2], mouse, CD32, lightpen, buttons, directions, joypot[2], mode.
++ * This is auxiliary live state, not a replacement savestate chunk.
++ */
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
++unsigned int e9k_debug_amiga_get_pot_state(unsigned int *out, unsigned int words)
++{
++    unsigned int n = 0;
++    int port, axis;
++    if (!out || words < 40) return 40;
++    out[n++] = 1;
++    out[n++] = potgo_value;
++    out[n++] = mouse_pullup;
++    out[n++] = currprefs.ntscmode;
++    for (port = 0; port < 2; ++port) {
++        for (axis = 0; axis < 2; ++axis) out[n++] = pot_cap[port][axis];
++        for (axis = 0; axis < 2; ++axis) out[n++] = pot_dat[port][axis];
++        for (axis = 0; axis < 2; ++axis) out[n++] = pot_dat_act[port][axis];
++        for (axis = 0; axis < 2; ++axis) out[n++] = analog_port[port][axis];
++        for (axis = 0; axis < 2; ++axis) out[n++] = digital_port[port][axis];
++        out[n++] = mouse_port[port];
++        out[n++] = cd32_pad_enabled[port];
++        out[n++] = lightpen_port[port];
++        out[n++] = joybutton[port];
++        out[n++] = joydir[port];
++        for (axis = 0; axis < 2; ++axis) out[n++] = joydirpot[port][axis];
++        out[n++] = joymodes[port][0];
++    }
++    return n;
++}
++
++/* Read-only profile companion: version, dongle, CDTV, two-lightpen
++ * multiplexing enabled, any lightpen enabled, arcade flags, bounce active.
++ * ABI2 has seven words. Caller must pause execution.
++ */
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
++unsigned int e9k_debug_amiga_get_pot_profile(unsigned int *out, unsigned int words)
++{
++    if (!out || words < 7) return 7;
++    out[0] = 2;
++    out[1] = currprefs.dongle;
++    out[2] = currprefs.cs_cdtvcd;
++    out[3] = lightpen_enabled2;
++    out[4] = lightpen_enabled;
++    out[5] = alg_flag;
++    out[6] = bouncy;
++    return 7;

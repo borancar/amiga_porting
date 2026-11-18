@@ -1,0 +1,262 @@
+--- a/ami9000/sources/src/audio.c
++++ b/ami9000/sources/src/audio.c
+@@ -366,6 +366,13 @@
+ 
+ static evt_t last_cycles;
+ static float next_sample_evtime;
++#ifdef SAVESTATE
++static bool checkpoint_audio_phase_valid;
++static bool checkpoint_audio_filter_valid;
++static float checkpoint_audio_filter[20];
++static evt_t checkpoint_audio_last_cycles;
++static float checkpoint_audio_next_sample, checkpoint_audio_scaled_sample;
++#endif
+ static int previous_volcnt_update;
+ 
+ typedef uae_s8 sample8_t;
+@@ -2853,6 +2860,8 @@
+ 
+ void restore_audio_start(void)
+ {
++    checkpoint_audio_phase_valid = false;
++    checkpoint_audio_filter_valid = false;
+ 	audio_event_reset();
+ }
+ 
+@@ -3047,3 +3056,132 @@
+ 	if (cas->cda_streamid > 0)
+ 		audio_activate();
+ }
++
++#ifdef SAVESTATE
++/* Exact IEEE-754 phase bits; this record does not serialize mixer/filter/FIFO state. */
++static bool audio_checkpoint_phase_values_supported(float next, float scaled)
++{
++    return sizeof(float) == 4 && isfinite(next) && isfinite(scaled) &&
++        next >= 0 && next < 4294967296.0f && scaled > 0 && scaled < 4294967296.0f;
++}
++
++bool audio_checkpoint_phase_supported(void)
++{
++    return audio_checkpoint_phase_values_supported(next_sample_evtime, scaled_sample_evtime) &&
++        last_cycles <= get_cycles() && audio_checkpoint_filter_supported();
++}
++
++bool audio_checkpoint_phase_payload_supported(const uae_u8 *payload)
++{
++    uae_u32 next_bits = ((uae_u32)payload[12] << 24) | ((uae_u32)payload[13] << 16) |
++        ((uae_u32)payload[14] << 8) | payload[15];
++    uae_u32 scaled_bits = ((uae_u32)payload[16] << 24) | ((uae_u32)payload[17] << 16) |
++        ((uae_u32)payload[18] << 8) | payload[19];
++    float next, scaled;
++    if (sizeof(float) != 4) return false;
++    memcpy(&next, &next_bits, 4);
++    memcpy(&scaled, &scaled_bits, 4);
++    return audio_checkpoint_phase_values_supported(next, scaled);
++}
++
++uae_u8 *save_audio_checkpoint_phase(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 20);
++    uae_u8 *dst = dstbak;
++    uae_u32 next_bits, scaled_bits;
++    memcpy(&next_bits, &next_sample_evtime, 4);
++    memcpy(&scaled_bits, &scaled_sample_evtime, 4);
++    save_u32(1);
++    save_u64(last_cycles);
++    save_u32(next_bits);
++    save_u32(scaled_bits);
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_audio_checkpoint_phase(uae_u8 *src)
++{
++    checkpoint_audio_phase_valid = false;
++    if (restore_u32() != 1) return src;
++    checkpoint_audio_last_cycles = restore_u64();
++    uae_u32 bits = restore_u32();
++    memcpy(&checkpoint_audio_next_sample, &bits, 4);
++    bits = restore_u32();
++    memcpy(&checkpoint_audio_scaled_sample, &bits, 4);
++    checkpoint_audio_phase_valid = true;
++    return src;
++}
++
++bool audio_checkpoint_phase_finish(void)
++{
++    if (!checkpoint_audio_phase_valid || checkpoint_audio_last_cycles > get_cycles() ||
++        !audio_checkpoint_phase_values_supported(checkpoint_audio_next_sample, checkpoint_audio_scaled_sample))
++        return false;
++    last_cycles = checkpoint_audio_last_cycles;
++    next_sample_evtime = checkpoint_audio_next_sample;
++    scaled_sample_evtime = checkpoint_audio_scaled_sample;
++    checkpoint_audio_phase_valid = false;
++    return true;
++}
++#endif
++
++#ifdef SAVESTATE
++bool audio_checkpoint_filter_supported(void)
++{
++    if (sizeof(float) != 4 || sizeof(sound_filter_state) != 80) return false;
++    float values[20];
++    memcpy(values, sound_filter_state, 80);
++    for (int i = 0; i < 20; ++i) if (!isfinite(values[i])) return false;
++    return true;
++}
++
++bool audio_checkpoint_filter_payload_supported(const uae_u8 *payload)
++{
++    if (sizeof(float) != 4) return false;
++    for (int i = 0; i < 20; ++i) {
++        const uae_u8 *p = payload + 4 + 4 * i;
++        uae_u32 bits = ((uae_u32)p[0] << 24) | ((uae_u32)p[1] << 16) | ((uae_u32)p[2] << 8) | p[3];
++        float value;
++        memcpy(&value, &bits, 4);
++        if (!isfinite(value)) return false;
++    }
++    return true;
++}
++
++uae_u8 *save_audio_checkpoint_filter(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 84);
++    uae_u8 *dst = dstbak;
++    float values[20];
++    memcpy(values, sound_filter_state, 80);
++    save_u32(1);
++    for (int i = 0; i < 20; ++i) {
++        uae_u32 bits;
++        memcpy(&bits, &values[i], 4);
++        save_u32(bits);
++    }
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_audio_checkpoint_filter(uae_u8 *src)
++{
++    checkpoint_audio_filter_valid = false;
++    if (restore_u32() != 1) return src;
++    for (int i = 0; i < 20; ++i) {
++        uae_u32 bits = restore_u32();
++        memcpy(&checkpoint_audio_filter[i], &bits, 4);
++    }
++    checkpoint_audio_filter_valid = true;
++    return src;
++}
++
++bool audio_checkpoint_filter_finish(void)
++{
++    if (!checkpoint_audio_filter_valid || sizeof(sound_filter_state) != 80) return false;
++    for (int i = 0; i < 20; ++i) if (!isfinite(checkpoint_audio_filter[i])) return false;
++    memcpy(sound_filter_state, checkpoint_audio_filter, 80);
++    checkpoint_audio_filter_valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -328,3 +328,15 @@
+ extern uae_u8 *save_custom_checkpoint_vblank(size_t *len, uae_u8 *dstptr);
+ extern uae_u8 *restore_custom_checkpoint_vblank(uae_u8 *src);
+ extern bool custom_checkpoint_vblank_finish(void);
++
++extern bool audio_checkpoint_phase_supported(void);
++extern bool audio_checkpoint_phase_payload_supported(const uae_u8 *payload);
++extern uae_u8 *save_audio_checkpoint_phase(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_audio_checkpoint_phase(uae_u8 *src);
++extern bool audio_checkpoint_phase_finish(void);
++
++extern bool audio_checkpoint_filter_supported(void);
++extern bool audio_checkpoint_filter_payload_supported(const uae_u8 *payload);
++extern uae_u8 *save_audio_checkpoint_filter(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_audio_checkpoint_filter(uae_u8 *src);
++extern bool audio_checkpoint_filter_finish(void);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,11 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("CHVP")))
++		else if (!_tcscmp (name, _T("AUDF")))
++            end = restore_audio_checkpoint_filter(chunk);
++        else if (!_tcscmp (name, _T("AUDS")))
++            end = restore_audio_checkpoint_phase(chunk);
++        else if (!_tcscmp (name, _T("CHVP")))
+             end = restore_custom_checkpoint_vblank(chunk);
+         else if (!_tcscmp (name, _T("BLCU")))
+             end = restore_blitter_checkpoint_cursor(chunk);
+@@ -1311,6 +1315,14 @@
+     xfree(dst);
+ #endif
+ 
++    dst = save_audio_checkpoint_filter(&len, 0);
++    save_chunk(f, dst, len, _T("AUDF"), 0);
++    xfree(dst);
++
++    dst = save_audio_checkpoint_phase(&len, 0);
++    save_chunk(f, dst, len, _T("AUDS"), 0);
++    xfree(dst);
++
+     dst = save_custom_checkpoint_vblank(&len, 0);
+     save_chunk(f, dst, len, _T("CHVP"), 0);
+     xfree(dst);
+@@ -1384,7 +1396,7 @@
+ 		}
+ 	}
+ #ifdef __LIBRETRO__
+-    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported() || !event_scheduler_checkpoint_supported() || !blitter_checkpoint_cursor_supported())
++    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported() || !event_scheduler_checkpoint_supported() || !blitter_checkpoint_cursor_supported() || !audio_checkpoint_phase_supported())
+         return NULL;
+ #endif
+ 	new_blitter = false;
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -9353,6 +9353,8 @@
+     bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
+     bool av_seen = false, blitter_cursor_seen = false, vblank_seen = false;
++    const uint8_t *audio_phase_payload = NULL;
++    bool audio_filter_seen = false;
+     const uint8_t *scheduler_payload = NULL, *timing_payload = NULL, *bus_payload = NULL;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+@@ -9378,6 +9380,16 @@
+                 if (payload[84 + i * 17] > 1) return false;
+             timing_seen = true;
+             timing_payload = payload;
++        }
++        if (!memcmp(chunk, "AUDF", 4)) {
++            if (audio_filter_seen || payload_size != 84 || e9k_snapshot_be32(payload) != 1 ||
++                !audio_checkpoint_filter_payload_supported(payload)) return false;
++            audio_filter_seen = true;
++        }
++        if (!memcmp(chunk, "AUDS", 4)) {
++            if (audio_phase_payload || payload_size != 20 || e9k_snapshot_be32(payload) != 1 ||
++                !audio_checkpoint_phase_payload_supported(payload)) return false;
++            audio_phase_payload = payload;
+         }
+         if (!memcmp(chunk, "CHVP", 4)) {
+             if (vblank_seen || payload_size != 27 || e9k_snapshot_be32(payload) != 1) return false;
+@@ -9427,6 +9439,9 @@
+     if (av_seen && (!timing_payload || !scheduler_payload || !bus_payload)) return false;
+     if (blitter_cursor_seen && (!timing_payload || !scheduler_payload || !bus_payload || !av_seen)) return false;
+     if (vblank_seen && (!blitter_cursor_seen || !av_seen || !bus_payload || !timing_payload || !scheduler_payload)) return false;
++    if (audio_phase_payload && (!vblank_seen || !blitter_cursor_seen || !av_seen || !bus_payload ||
++        !timing_payload || !scheduler_payload || memcmp(audio_phase_payload + 4, timing_payload + 68, 8) > 0)) return false;
++    if (audio_filter_seen && !audio_phase_payload) return false;
+     libretro_restore_scheduler = scheduler_payload != NULL;
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+@@ -9438,6 +9453,8 @@
+     if (ok && av_seen) ok = libretro_av_checkpoint_finish();
+     if (ok && blitter_cursor_seen) ok = blitter_checkpoint_cursor_finish();
+     if (ok && vblank_seen) ok = custom_checkpoint_vblank_finish();
++    if (ok && audio_phase_payload) ok = audio_checkpoint_phase_finish();
++    if (ok && audio_filter_seen) ok = audio_checkpoint_filter_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;

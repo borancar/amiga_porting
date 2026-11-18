@@ -1,0 +1,55 @@
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -5150,6 +5150,37 @@
+     return 1;
+ }
+ 
++/* Explicit elapsed-time replay input. The selected RAM accumulator is the
++ * clock service input only; guest instructions still consume it and calculate
++ * all resulting state. Disabled unless a bounded series is installed paused. */
++static uint32_t e9k_clock_pc, e9k_clock_address;
++static uint32_t e9k_clock_values[4096], e9k_clock_count, e9k_clock_index;
++E9K_RECOMP_EXPORT int e9k_debug_set_clock_inputs(uint32_t pc, uint32_t address,
++    const uint32_t *values, uint32_t count)
++{
++    if (!e9k_debug_is_paused()) return 0;
++    if (!values && count == 0) {
++        e9k_clock_count = e9k_clock_index = 0;
++        return 1;
++    }
++    if (!values || !count || count > 4096 || (pc & 1) || pc > 0xffffffu ||
++        (address & 1) || address > 0xfffffcu || bankindex(address) != bankindex(address + 3))
++        return 0;
++    addrbank *bank = &get_mem_bank(address);
++    if (!(bank->flags & ABFLAG_RAM) || (bank->flags & ABFLAG_IO) ||
++        !bank->check || !bank->check(address, 4)) return 0;
++    memcpy(e9k_clock_values, values, count * sizeof(*values));
++    e9k_clock_pc = pc;
++    e9k_clock_address = address;
++    e9k_clock_count = count;
++    e9k_clock_index = 0;
++    return 1;
++}
++E9K_RECOMP_EXPORT uint32_t e9k_debug_clock_inputs_consumed(void)
++{
++    return e9k_clock_index;
++}
++
+ static bool e9k_recomp_active;
+ static uint32_t e9k_recomp_bus_clocks;
+ 
+@@ -5345,6 +5376,14 @@
+ #endif
+ 
+ #if E9K_HACK_DEBUGGER_RUNTIME
++                if (e9k_clock_count && r->instruction_pc == e9k_clock_pc) {
++                    if (e9k_clock_index == e9k_clock_count) {
++                        e9k_debug_pause();
++                        exit = true;
++                        continue;
++                    }
++                    put_long(e9k_clock_address, e9k_clock_values[e9k_clock_index++]);
++                }
+                 if (e9k_pc_observer && r->instruction_pc == e9k_pc_observer_address)
+                     e9k_pc_observer(r->instruction_pc, (uint32_t)r->opcode);
+                 if (e9k_recomp_executor) {

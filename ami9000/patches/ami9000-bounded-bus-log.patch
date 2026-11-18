@@ -1,0 +1,168 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -17469,6 +17469,52 @@
+ // blitter idle cycles do count!)
+ 
+ extern int cpu_tracer;
++/* Bounded process-local diagnostics; disabled unless explicitly selected. */
++struct e9k_checkpoint_bus_row {
++    uae_u64 start, synced, prepared, granted, end;
++    uae_u32 pc, address, value, kind;
++    uae_s32 mode, hpos, vpos, requested;
++};
++struct e9k_checkpoint_bus_row e9k_checkpoint_bus_log[4096];
++unsigned int e9k_checkpoint_bus_log_count;
++unsigned int e9k_checkpoint_bus_log_overflow;
++unsigned int e9k_checkpoint_bus_log_skip;
++int e9k_checkpoint_bus_log_enabled;
++
++static struct e9k_checkpoint_bus_row *checkpoint_bus_begin(unsigned int kind, uaecptr address, int mode, int requested)
++{
++    if (!e9k_checkpoint_bus_log_enabled) return NULL;
++    if (e9k_checkpoint_bus_log_skip) { e9k_checkpoint_bus_log_skip--; return NULL; }
++    if (e9k_checkpoint_bus_log_count >= 4096) {
++        e9k_checkpoint_bus_log_overflow++;
++        return NULL;
++    }
++    struct e9k_checkpoint_bus_row *row = &e9k_checkpoint_bus_log[e9k_checkpoint_bus_log_count++];
++    row->start = row->synced = row->prepared = row->granted = row->end = get_cycles();
++    row->pc = regs.instruction_pc;
++    row->address = address;
++    row->value = 0;
++    row->kind = kind;
++    row->mode = mode;
++    row->hpos = current_hpos_safe();
++    row->vpos = vpos;
++    row->requested = requested;
++    return row;
++}
++
++void e9k_checkpoint_log_irq(int stage, int level)
++{
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(stage,
++        ((uae_u32)intena << 16) | intreq, regs.ipl_pin, regs.ipl_evt_pre_mode);
++    if (row) row->value = level;
++}
++
++void e9k_checkpoint_log_exception(int nr)
++{
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(5, m68k_getpc(), regs.intmask, regs.ipl_pin);
++    if (row) row->value = nr;
++}
++
+ static int dma_cycle(int *mode, int *ipl)
+ {
+ 	int hpos_next, hpos_old;
+@@ -17493,6 +17539,11 @@
+ 			// copper may have been waiting for the blitter
+ 			sync_copper(hpos_next);
+ 		}
++        struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(4, 0, bpldma, 0);
++        if (row) {
++            row->hpos = hpos_old;
++            row->value = cycle_line_slot[hpos_old];
++        }
+ 		if ((cycle_line_slot[hpos_old] & CYCLE_MASK) == 0 && !bpldma) {
+ 			alloc_cycle(hpos_old, CYCLE_CPU);
+ 			break;
+@@ -17535,12 +17586,16 @@
+ 	int hpos;
+ 	int ipl = regs.ipl[0];
+ 	evt_t now = get_cycles();
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(1, addr, mode, 0);
+ 
+ 	sync_cycles();
++    if (row) row->synced = get_cycles();
+ 
+ 	x_do_cycles_pre(CYCLE_UNIT);
++    if (row) row->prepared = get_cycles();
+ 
+ 	hpos = dma_cycle(&mode, &ipl);
++    if (row) { row->granted = get_cycles(); row->hpos = hpos; }
+ 
+ #ifdef DEBUGGER
+ 	if (debug_dma) {
+@@ -17588,6 +17643,7 @@
+ 	regs.chipset_latch_rw = regs.chipset_latch_read = v;
+ 
+ 	x_do_cycles_post(CYCLE_UNIT, v);
++    if (row) { row->end = get_cycles(); row->value = v; }
+ 
+ 	// if IPL fetch was pending and CPU had wait states
+ 	// Use ipl_pin value from previous cycle
+@@ -17603,12 +17659,16 @@
+ 	int hpos;
+ 	int ipl = regs.ipl[0];
+ 	evt_t now = get_cycles();
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(2, addr, mode, 0);
+ 
+ 	sync_cycles();
++    if (row) row->synced = get_cycles();
+ 
+ 	x_do_cycles_pre(CYCLE_UNIT);
++    if (row) row->prepared = get_cycles();
+ 
+ 	hpos = dma_cycle(&mode, &ipl);
++    if (row) { row->granted = get_cycles(); row->hpos = hpos; }
+ 
+ #ifdef DEBUGGER
+ 	if (debug_dma) {
+@@ -17640,6 +17700,7 @@
+ 	regs.chipset_latch_rw = regs.chipset_latch_write = v;
+ 
+ 	x_do_cycles_post(CYCLE_UNIT, v);
++    if (row) { row->end = get_cycles(); row->value = v; }
+ 
+ 	// if IPL fetch was pending and CPU had wait states:
+ 	// Use ipl_pin value from previous cycle
+@@ -17745,6 +17806,7 @@
+ 
+ void do_cycles_ce(int cycles)
+ {
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(3, 0, 0, cycles);
+ 	cycles += extra_cycle;
+ 	while (cycles >= CYCLE_UNIT) {
+ 		int hpos = current_hpos() + 1;
+@@ -17758,6 +17820,7 @@
+ 		cycles -= CYCLE_UNIT;
+ 	}
+ 	extra_cycle = cycles;
++    if (row) row->end = get_cycles();
+ }
+ 
+ void do_cycles_ce020(int cycles)
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -3503,6 +3503,10 @@
+ // address = format $2 stack frame address field
+ static void ExceptionX (int nr, uaecptr address, uaecptr oldpc)
+ {
++#ifdef CPUEMU_13
++    extern void e9k_checkpoint_log_exception(int nr);
++    e9k_checkpoint_log_exception(nr);
++#endif
+ 	uaecptr pc = m68k_getpc();
+ 	regs.exception = nr;
+ 	regs.loop_mode = 0;
+@@ -4658,6 +4662,10 @@
+ 
+ static void update_ipl(int ipl)
+ {
++#ifdef CPUEMU_13
++    extern void e9k_checkpoint_log_irq(int stage, int level);
++    e9k_checkpoint_log_irq(7, ipl);
++#endif
+ 	evt_t c = get_cycles();
+ 	regs.ipl_pin_change_evt_p = regs.ipl_pin_change_evt;
+ 	regs.ipl_pin_p = regs.ipl_pin;
+@@ -4695,6 +4703,10 @@
+ 	}
+ #endif
+ 	int ipl = intlev();
++#ifdef CPUEMU_13
++    extern void e9k_checkpoint_log_irq(int stage, int level);
++    e9k_checkpoint_log_irq(6, ipl);
++#endif
+ 
+ 	if (regs.ipl_pin != ipl) {
+ 

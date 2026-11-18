@@ -1,0 +1,337 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16522,6 +16522,7 @@
+ void restore_custom_start(void)
+ {
+     checkpoint_timing.valid = false;
++    event_scheduler_checkpoint_clear();
+ 	memset(&cop_state, 0, sizeof(cop_state));
+ 	cop_state.state = COP_stop;
+ }
+@@ -17219,7 +17220,7 @@
+     event_audxdat_func, event_setdsr, event_CIA_synced_interrupt,
+     event_doint_delay_do_intreq, event_doint_delay_do_intena,
+     event_CIA_tod_inc_event, event_DISK_handler, bitplane_dma_change,
+-    events_dmal_hsync2
++    events_dmal_hsync2, blitter_handler, vdiw_change, delayed_framestart
+ };
+ 
+ bool custom_event_delay_type_supported(unsigned int type)
+@@ -17248,6 +17249,10 @@
+ 
+ uae_u8 *restore_custom_event_delay(uae_u8 *src)
+ {
++#ifdef __LIBRETRO__
++    extern bool libretro_restore_scheduler;
++    if (libretro_restore_scheduler) return src + 5 + src[4] * 13;
++#endif
+     if (restore_u32() != 1)
+         return src;
+     int cnt = restore_u8();
+@@ -17900,3 +17905,15 @@
+     return true;
+ }
+ #endif
++
++#ifdef SAVESTATE
++unsigned int custom_event_slot_handler_id(int slot)
++{
++    return custom_event_delay_type(eventtab2[slot].handler);
++}
++
++void custom_event_slot_set_handler(int slot, unsigned int id)
++{
++    eventtab2[slot].handler = id ? saved_custom_event_handlers[id] : NULL;
++}
++#endif
+--- a/ami9000/sources/src/events.c
++++ b/ami9000/sources/src/events.c
+@@ -20,6 +20,7 @@
+ #include "x86.h"
+ #include "audio.h"
+ #include "cia.h"
++#include "savestate.h"
+ 
+ static const int pissoff_nojit_value = 256 * CYCLE_UNIT;
+ 
+@@ -318,21 +319,22 @@
+ 
+ static struct ev2 *last_event2;
+ static struct ev2 dummy_event;
++static int event2_next_slot = ev2_misc;
++static bool event2_recheck;
++static int event2_depth;
+ 
+ void MISC_handler(void)
+ {
+-	static bool dorecheck;
+ 	bool recheck;
+ 	int i;
+ 	evt_t mintime;
+ 	evt_t ct = get_cycles();
+-	static int recursive;
+-
+-	if (recursive) {
+-		dorecheck = true;
++
++	if (event2_depth) {
++		event2_recheck = true;
+ 		return;
+ 	}
+-	recursive++;
++	event2_depth++;
+ 	eventtab[ev_misc].active = 0;
+ 	recheck = true;
+ 	while (recheck) {
+@@ -352,9 +354,9 @@
+ 							e2->handler(e2->data);
+ 						}
+ 					}
+-					if (dorecheck || e->active) {
++					if (event2_recheck || e->active) {
+ 						recheck = true;
+-						dorecheck = false;
++						event2_recheck = false;
+ 					}
+ 				} else {
+ 					evt_t eventtime = e->evtime - ct;
+@@ -371,7 +373,7 @@
+ 		e->evtime = ct + mintime;
+ 		events_schedule();
+ 	}
+-	recursive--;
++	event2_depth--;
+ }
+ 
+ void event2_newevent_xx_ce(evt_t t, uae_u32 data, evfunc2 func)
+@@ -386,11 +388,10 @@
+ void event2_newevent_xx(int no, evt_t t, uae_u32 data, evfunc2 func)
+ {
+ 	evt_t et;
+-	static int next = ev2_misc;
+ 
+ 	et = t + get_cycles();
+ 	if (no < 0) {
+-		no = next;
++		no = event2_next_slot;
+ 		for (;;) {
+ 			if (!eventtab2[no].active) {
+ 				break;
+@@ -400,7 +401,7 @@
+ 			no++;
+ 			if (no == ev2_max)
+ 				no = ev2_misc;
+-			if (no == next) {
++			if (no == event2_next_slot) {
+ 				write_log (_T("out of event2's!\n"));
+ 				// execute most recent event immediately
+ 				evt_t mintime = EVT_MAX;
+@@ -422,7 +423,7 @@
+ 				continue;
+ 			}
+ 		}
+-		next = no;
++		event2_next_slot = no;
+ 	}
+ 	struct ev2 *e = &eventtab2[no];
+ 	// if previous event has same expiry time, make sure it gets executed first.
+@@ -498,3 +499,99 @@
+ 		eventtab2[i].active = 0;
+ 	}
+ }
++
++#ifdef SAVESTATE
++/* Pointer identities are process-local; only slot indices go on the wire. */
++static int event2_slot_index(const struct ev2 *event)
++{
++    if (!event) return 255;
++    if (event == &dummy_event) return 254;
++    for (int i = 0; i < ev2_max; ++i)
++        if (event == &eventtab2[i]) return i;
++    return -1;
++}
++
++static struct {
++    bool valid;
++    evt_t cycle;
++    uae_u8 cursor, last;
++    struct ev2 events[ev2_max];
++    uae_u8 ids[ev2_max], links[ev2_max];
++} scheduler_checkpoint;
++
++void event_scheduler_checkpoint_clear(void)
++{
++    scheduler_checkpoint.valid = false;
++}
++
++bool event_scheduler_checkpoint_supported(void)
++{
++    if (event2_depth || event2_recheck || event2_next_slot < ev2_misc ||
++        event2_next_slot >= ev2_max || !last_event2 || event2_slot_index(last_event2) < 0)
++        return false;
++    for (int i = 0; i < ev2_max; ++i) {
++        int link = event2_slot_index(eventtab2[i].next);
++        if (link < 0 || link == 254 ||
++            (eventtab2[i].handler && !custom_event_slot_handler_id(i)))
++            return false;
++    }
++    return true;
++}
++
++uae_u8 *save_event_scheduler_checkpoint(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 194);
++    uae_u8 *dst = dstbak;
++    save_u32(1);
++    save_u64(get_cycles());
++    save_u8(event2_next_slot);
++    save_u8(event2_slot_index(last_event2));
++    for (int i = 0; i < ev2_max; ++i) {
++        save_u8(eventtab2[i].active ? 1 : 0);
++        save_u8(custom_event_slot_handler_id(i));
++        save_u8(event2_slot_index(eventtab2[i].next));
++        save_u64(eventtab2[i].evtime);
++        save_u32(eventtab2[i].data);
++    }
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_event_scheduler_checkpoint(uae_u8 *src)
++{
++    scheduler_checkpoint.valid = false;
++    if (restore_u32() != 1) return src;
++    scheduler_checkpoint.cycle = restore_u64();
++    scheduler_checkpoint.cursor = restore_u8();
++    scheduler_checkpoint.last = restore_u8();
++    for (int i = 0; i < ev2_max; ++i) {
++        scheduler_checkpoint.events[i].active = restore_u8() != 0;
++        scheduler_checkpoint.ids[i] = restore_u8();
++        scheduler_checkpoint.links[i] = restore_u8();
++        scheduler_checkpoint.events[i].evtime = restore_u64();
++        scheduler_checkpoint.events[i].data = restore_u32();
++    }
++    scheduler_checkpoint.valid = true;
++    return src;
++}
++
++bool event_scheduler_checkpoint_finish(void)
++{
++    if (!scheduler_checkpoint.valid || event2_depth ||
++        get_cycles() != scheduler_checkpoint.cycle) return false;
++    for (int i = 0; i < ev2_max; ++i) {
++        eventtab2[i].active = scheduler_checkpoint.events[i].active;
++        eventtab2[i].evtime = scheduler_checkpoint.events[i].evtime;
++        eventtab2[i].data = scheduler_checkpoint.events[i].data;
++        custom_event_slot_set_handler(i, scheduler_checkpoint.ids[i]);
++        unsigned int link = scheduler_checkpoint.links[i];
++        eventtab2[i].next = link == 255 ? NULL : &eventtab2[link];
++    }
++    event2_next_slot = scheduler_checkpoint.cursor;
++    unsigned int last = scheduler_checkpoint.last;
++    last_event2 = last == 255 ? NULL : last == 254 ? &dummy_event : &eventtab2[last];
++    event2_recheck = false;
++    scheduler_checkpoint.valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -300,3 +300,11 @@
+ extern uae_u8 *save_custom_checkpoint_timing(size_t *len, uae_u8 *dstptr);
+ extern uae_u8 *restore_custom_checkpoint_timing(uae_u8 *src);
+ extern bool custom_checkpoint_timing_finish(void);
++
++extern unsigned int custom_event_slot_handler_id(int slot);
++extern void custom_event_slot_set_handler(int slot, unsigned int id);
++extern void event_scheduler_checkpoint_clear(void);
++extern bool event_scheduler_checkpoint_supported(void);
++extern uae_u8 *save_event_scheduler_checkpoint(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_event_scheduler_checkpoint(uae_u8 *src);
++extern bool event_scheduler_checkpoint_finish(void);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,9 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("CHTM")))
++		else if (!_tcscmp (name, _T("EVSC")))
++            end = restore_event_scheduler_checkpoint(chunk);
++        else if (!_tcscmp (name, _T("CHTM")))
+             end = restore_custom_checkpoint_timing(chunk);
+         else if (!_tcscmp (name, _T("CHSL")))
+ 			end = restore_custom_slots (chunk);
+@@ -1292,6 +1294,10 @@
+ 		xfree(dst);
+ 	}
+ 
++    dst = save_event_scheduler_checkpoint(&len, 0);
++    save_chunk(f, dst, len, _T("EVSC"), 0);
++    xfree(dst);
++
+     dst = save_custom_checkpoint_timing(&len, 0);
+     save_chunk(f, dst, len, _T("CHTM"), 0);
+     xfree(dst);
+@@ -1349,7 +1355,7 @@
+ 		}
+ 	}
+ #ifdef __LIBRETRO__
+-    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported())
++    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported() || !event_scheduler_checkpoint_supported())
+         return NULL;
+ #endif
+ 	new_blitter = false;
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -71,6 +71,7 @@
+ bool libretro_runloop_active = false;
+ bool libretro_frame_end = false;
+ bool libretro_restore_exact = false;
++bool libretro_restore_scheduler = false;
+ unsigned short int retro_bmp[RETRO_BMP_SIZE] = {0};
+ unsigned int retro_bmp_offset = 0;
+ unsigned short int defaultw = EMULATOR_DEF_WIDTH / 2;
+@@ -9297,6 +9298,7 @@
+     size_t offset = 0;
+     bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
++    const uint8_t *scheduler_payload = NULL, *timing_payload = NULL;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+     while (offset <= size - 8) {
+@@ -9320,6 +9322,18 @@
+             for (unsigned int i = 0; i < 5; ++i)
+                 if (payload[84 + i * 17] > 1) return false;
+             timing_seen = true;
++            timing_payload = payload;
++        }
++        if (!memcmp(chunk, "EVSC", 4)) {
++            if (scheduler_payload || payload_size != 194 || e9k_snapshot_be32(payload) != 1 ||
++                payload[12] < 1 || payload[12] >= 12 ||
++                (payload[13] >= 12 && payload[13] != 254)) return false;
++            for (unsigned int i = 0; i < 12; ++i) {
++                const uint8_t *event = payload + 14 + 15 * i;
++                if (event[0] > 1 || (event[1] && !custom_event_delay_type_supported(event[1])) ||
++                    (event[0] && !event[1]) || (event[2] >= 12 && event[2] != 255)) return false;
++            }
++            scheduler_payload = payload;
+         }
+         if (!memcmp(chunk, "CHPD", 4)) {
+             if (payload_size < 5 || e9k_snapshot_be32(payload) != 1 || payload_size != 5u + payload[4] * 13u)
+@@ -9332,10 +9346,15 @@
+     }
+     if (!ended || !cpu_seen || savestate_state)
+         return false;
++    if (scheduler_payload && (!timing_payload || memcmp(scheduler_payload + 4, timing_payload + 68, 8)))
++        return false;
++    libretro_restore_scheduler = scheduler_payload != NULL;
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+     libretro_restore_exact = false;
++    libretro_restore_scheduler = false;
+     if (ok && timing_seen) ok = custom_checkpoint_timing_finish();
++    if (ok && scheduler_payload) ok = event_scheduler_checkpoint_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;

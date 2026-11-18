@@ -1,0 +1,93 @@
+--- a/ami9000/libretro/e9k_debug.c	2026-10-16 01:29:30.836635031 +0300
++++ b/ami9000/libretro/e9k_debug.c	2026-10-16 01:29:30.852658403 +0300
+@@ -972,6 +972,45 @@
+ 	return e9k_debug_paused;
+ }
+ 
++/* Hooks: a callback the host gets at chosen PCs from inside the instruction loop. Unlike a breakpoint it does not
++ * halt anything: the machine keeps running, the frame is not cut short and audio and video carry on. If the
++ * callback changes the PC, the loop restarts at the new PC (the instruction at the old one is not executed). If it
++ * calls e9k_debug_pause() the machine halts there, and the hook does not fire again at that PC when it resumes. */
++#define E9K_DEBUG_HOOK_MAP_BYTES (1u << 20) /* one bit per even address in the 24-bit space */
++static uint8_t *e9k_debug_hookMap = NULL;
++static void (*e9k_debug_hookCallback)(uint32_t pc) = NULL;
++static int e9k_debug_hookSkipValid = 0;
++static uint32_t e9k_debug_hookSkipPc = 0;
++
++E9K_DEBUG_EXPORT void
++e9k_debug_set_hook_callback(void (*cb)(uint32_t pc))
++{
++	e9k_debug_hookCallback = cb;
++}
++
++E9K_DEBUG_EXPORT void
++e9k_debug_add_hook(uint32_t addr)
++{
++	if (!e9k_debug_hookMap) {
++		e9k_debug_hookMap = (uint8_t *)calloc(E9K_DEBUG_HOOK_MAP_BYTES, 1);
++		if (!e9k_debug_hookMap) {
++			return;
++		}
++	}
++	addr &= 0x00ffffffu;
++	e9k_debug_hookMap[addr >> 4] |= (uint8_t)(1u << ((addr >> 1) & 7u));
++}
++
++E9K_DEBUG_EXPORT void
++e9k_debug_remove_hook(uint32_t addr)
++{
++	if (!e9k_debug_hookMap) {
++		return;
++	}
++	addr &= 0x00ffffffu;
++	e9k_debug_hookMap[addr >> 4] &= (uint8_t)~(1u << ((addr >> 1) & 7u));
++}
++
+ E9K_DEBUG_EXPORT void
+ e9k_debug_step_instr(void)
+ {
+@@ -2522,6 +2561,25 @@
+ 
+ 	e9k_debug_profiler_instrHook(pc24);
+ 
++	if (e9k_debug_hookMap && e9k_debug_hookCallback &&
++	    (e9k_debug_hookMap[pc24 >> 4] & (1u << ((pc24 >> 1) & 7u)))) {
++		if (e9k_debug_hookSkipValid && e9k_debug_hookSkipPc == pc24) {
++			e9k_debug_hookSkipValid = 0;
++		} else {
++			uaecptr pcBefore = m68k_getpc();
++			e9k_debug_hookCallback(pc24);
++			if (e9k_debug_paused) {
++				/* the callback halted the machine here: resume must not run this hook again */
++				e9k_debug_hookSkipPc = pc24;
++				e9k_debug_hookSkipValid = 1;
++				return 1;
++			}
++			if (m68k_getpc() != pcBefore) {
++				return 1; /* redirected: restart the instruction loop at the new PC, nothing is halted */
++			}
++		}
++	}
++
+ 	if (e9k_debug_stepInstrAfter) {
+ 		e9k_debug_requestBreak();
+ 		return 1;
+--- a/ami9000/libretro/e9k_debug.h	2026-10-16 01:29:30.839010047 +0300
++++ b/ami9000/libretro/e9k_debug.h	2026-10-16 01:29:30.852797775 +0300
+@@ -54,6 +54,16 @@
+ int
+ e9k_debug_is_paused(void);
+ 
++// Hooks: callback at chosen PCs from inside the instruction loop. Nothing is halted; see e9k_debug.c.
++void
++e9k_debug_set_hook_callback(void (*cb)(uint32_t pc));
++
++void
++e9k_debug_add_hook(uint32_t addr);
++
++void
++e9k_debug_remove_hook(uint32_t addr);
++
+ void
+ e9k_debug_step_instr(void);
+ 

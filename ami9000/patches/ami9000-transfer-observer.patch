@@ -1,0 +1,75 @@
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -5261,6 +5261,52 @@
+     return true;
+ }
+ 
++/* Observed successful JSR/JMP transfers. Host diagnostics only. */
++static uint32_t e9k_transfer_rows[8192][3], e9k_transfer_used, e9k_transfer_overflow;
++static bool e9k_transfer_enabled;
++E9K_RECOMP_EXPORT void e9k_debug_transfer_profile_start(void)
++{
++    memset(e9k_transfer_rows, 0, sizeof(e9k_transfer_rows));
++    e9k_transfer_used = e9k_transfer_overflow = 0;
++    e9k_transfer_enabled = true;
++}
++E9K_RECOMP_EXPORT void e9k_debug_transfer_profile_stop(void) { e9k_transfer_enabled = false; }
++E9K_RECOMP_EXPORT uint32_t e9k_debug_transfer_profile_overflow(void) { return e9k_transfer_overflow; }
++E9K_RECOMP_EXPORT uint32_t e9k_debug_transfer_profile_read(uint32_t *out, uint32_t capacity)
++{
++    if (!out || capacity < e9k_transfer_used) return 0;
++    uint32_t count = 0;
++    for (uint32_t i = 0; i < 8192; ++i) {
++        if (!e9k_transfer_rows[i][2]) continue;
++        memcpy(out + count * 3, e9k_transfer_rows[i], 3 * sizeof(*out));
++        count++;
++    }
++    return count;
++}
++static void e9k_transfer_record(uint32_t pc, uint32_t opcode, uint32_t sp)
++{
++    if (!e9k_transfer_enabled || e9k_transfer_overflow) return;
++    bool call = (opcode & 0xffc0u) == 0x4e80u;
++    if (!call && (opcode & 0xffc0u) != 0x4ec0u) return;
++    if (m68k_areg(regs, 7) != sp - (call ? 4u : 0u)) return;
++    uint32_t target = m68k_getpc();
++    uint32_t bucket = ((pc >> 1) ^ (target << 5)) & 8191u;
++    for (uint32_t probe = 0; probe < 8192; ++probe, bucket = (bucket + 1) & 8191u) {
++        uint32_t *row = e9k_transfer_rows[bucket];
++        if (!row[2]) {
++            row[0] = pc; row[1] = target; row[2] = 1;
++            e9k_transfer_used++;
++            return;
++        }
++        if (row[0] == pc && row[1] == target) {
++            if (row[2] == 0xffffffffu) e9k_transfer_overflow = 1;
++            else row[2]++;
++            return;
++        }
++    }
++    e9k_transfer_overflow = 1;
++}
++
+ static bool e9k_recomp_active;
+ static uint32_t e9k_recomp_bus_clocks;
+ 
+@@ -5456,6 +5502,9 @@
+ #endif
+ 
+ #if E9K_HACK_DEBUGGER_RUNTIME
++                uint32_t e9k_observed_pc = r->instruction_pc;
++                uint32_t e9k_observed_opcode = r->opcode;
++                uint32_t e9k_observed_sp = m68k_areg(regs, 7);
+                 if (!e9k_clock_sequence_step(r->instruction_pc)) {
+                     e9k_debug_pause();
+                     exit = true;
+@@ -5480,6 +5529,9 @@
+ 					regs.ird = regs.opcode;
+ 				regs.instruction_cnt++;
+ 				wait_memory_cycles();
++#if E9K_HACK_DEBUGGER_RUNTIME
++                e9k_transfer_record(e9k_observed_pc, e9k_observed_opcode, e9k_observed_sp);
++#endif
+ 				if (cpu_tracer) {
+ 					cputrace.state = 0;
+ 				}

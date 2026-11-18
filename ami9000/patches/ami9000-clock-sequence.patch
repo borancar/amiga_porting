@@ -1,0 +1,137 @@
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -5141,10 +5141,31 @@
+ /* Disabled by default; one read-only host observation before a selected PC. */
+ static void (*e9k_pc_observer)(uint32_t, uint32_t);
+ static uint32_t e9k_pc_observer_address;
++static uint32_t e9k_pc_observer_sites[16], e9k_pc_observer_site_count;
++E9K_RECOMP_EXPORT int e9k_debug_set_pc_observer_sites(const uint32_t *sites, uint32_t count,
++    void (*observer)(uint32_t, uint32_t))
++{
++    if (!e9k_debug_is_paused() || !sites || !observer || !count || count > 16) return 0;
++    for (uint32_t i = 0; i < count; ++i)
++        if ((sites[i] & 1) || sites[i] > 0xffffffu) return 0;
++    memcpy(e9k_pc_observer_sites, sites, count * sizeof(*sites));
++    e9k_pc_observer_site_count = count;
++    e9k_pc_observer = observer;
++    return 1;
++}
++static bool e9k_pc_observer_matches(uint32_t pc)
++{
++    if (!e9k_pc_observer_site_count) return pc == e9k_pc_observer_address;
++    for (uint32_t i = 0; i < e9k_pc_observer_site_count; ++i)
++        if (pc == e9k_pc_observer_sites[i]) return true;
++    return false;
++}
++
+ E9K_RECOMP_EXPORT int e9k_debug_set_pc_observer(uint32_t pc, void (*observer)(uint32_t, uint32_t))
+ {
+     if ((pc & 1) || pc > 0xffffffu || !e9k_debug_is_paused())
+         return 0;
++    e9k_pc_observer_site_count = 0;
+     e9k_pc_observer_address = pc;
+     e9k_pc_observer = observer;
+     return 1;
+@@ -5155,6 +5176,7 @@
+  * all resulting state. Disabled unless a bounded series is installed paused. */
+ static uint32_t e9k_clock_pc, e9k_clock_address;
+ static uint32_t e9k_clock_values[4096], e9k_clock_count, e9k_clock_index;
++static uint32_t e9k_clock_sequence_count;
+ E9K_RECOMP_EXPORT int e9k_debug_set_clock_inputs(uint32_t pc, uint32_t address,
+     const uint32_t *values, uint32_t count)
+ {
+@@ -5163,7 +5185,7 @@
+         e9k_clock_count = e9k_clock_index = 0;
+         return 1;
+     }
+-    if (!values || !count || count > 4096 || (pc & 1) || pc > 0xffffffu ||
++    if (e9k_clock_sequence_count || !values || !count || count > 4096 || (pc & 1) || pc > 0xffffffu ||
+         (address & 1) || address > 0xfffffcu || bankindex(address) != bankindex(address + 3))
+         return 0;
+     addrbank *bank = &get_mem_bank(address);
+@@ -5179,6 +5201,64 @@
+ E9K_RECOMP_EXPORT uint32_t e9k_debug_clock_inputs_consumed(void)
+ {
+     return e9k_clock_index;
++}
++
++/* Ordered time requests across up to sixteen witnessed service PCs.
++ * Each row is (PC, RAM accumulator address, elapsed input), never output state. */
++static uint32_t e9k_clock_sequence[4096][3];
++static uint32_t e9k_clock_sequence_index, e9k_clock_sequence_error;
++static uint32_t e9k_clock_sequence_sites[16], e9k_clock_sequence_site_count;
++E9K_RECOMP_EXPORT int e9k_debug_set_clock_input_sequence(const uint32_t *rows, uint32_t count)
++{
++    if (!e9k_debug_is_paused()) return 0;
++    if (!rows && !count) {
++        e9k_clock_sequence_count = e9k_clock_sequence_index = e9k_clock_sequence_error = 0;
++        e9k_clock_sequence_site_count = 0;
++        return 1;
++    }
++    if (!rows || !count || count > 4096 || e9k_clock_count) return 0;
++    uint32_t sites[16], addresses[16], site_count = 0;
++    for (uint32_t i = 0; i < count; ++i) {
++        uint32_t pc = rows[i * 3], address = rows[i * 3 + 1], site;
++        if ((pc & 1) || pc > 0xffffffu || (address & 1) || address > 0xfffffcu ||
++            bankindex(address) != bankindex(address + 3)) return 0;
++        addrbank *bank = &get_mem_bank(address);
++        if (!(bank->flags & ABFLAG_RAM) || (bank->flags & ABFLAG_IO) ||
++            !bank->check || !bank->check(address, 4)) return 0;
++        for (site = 0; site < site_count && sites[site] != pc; ++site) {}
++        if (site == site_count) {
++            if (site_count == 16) return 0;
++            sites[site_count] = pc;
++            addresses[site_count++] = address;
++        } else if (addresses[site] != address) return 0;
++    }
++    memcpy(e9k_clock_sequence, rows, count * 3 * sizeof(*rows));
++    memcpy(e9k_clock_sequence_sites, sites, site_count * sizeof(*sites));
++    e9k_clock_sequence_site_count = site_count;
++    e9k_clock_sequence_count = count;
++    e9k_clock_sequence_index = e9k_clock_sequence_error = 0;
++    return 1;
++}
++E9K_RECOMP_EXPORT uint32_t e9k_debug_clock_sequence_consumed(void) { return e9k_clock_sequence_index; }
++E9K_RECOMP_EXPORT uint32_t e9k_debug_clock_sequence_error(void) { return e9k_clock_sequence_error; }
++static bool e9k_clock_sequence_step(uint32_t pc)
++{
++    if (!e9k_clock_sequence_count) return true;
++    uint32_t site;
++    for (site = 0; site < e9k_clock_sequence_site_count && e9k_clock_sequence_sites[site] != pc; ++site) {}
++    if (site == e9k_clock_sequence_site_count) return true;
++    if (e9k_clock_sequence_index == e9k_clock_sequence_count) {
++        e9k_clock_sequence_error = 1;
++        return false;
++    }
++    const uint32_t *row = e9k_clock_sequence[e9k_clock_sequence_index];
++    if (row[0] != pc) {
++        e9k_clock_sequence_error = 2;
++        return false;
++    }
++    put_long(row[1], row[2]);
++    e9k_clock_sequence_index++;
++    return true;
+ }
+ 
+ static bool e9k_recomp_active;
+@@ -5376,6 +5456,11 @@
+ #endif
+ 
+ #if E9K_HACK_DEBUGGER_RUNTIME
++                if (!e9k_clock_sequence_step(r->instruction_pc)) {
++                    e9k_debug_pause();
++                    exit = true;
++                    continue;
++                }
+                 if (e9k_clock_count && r->instruction_pc == e9k_clock_pc) {
+                     if (e9k_clock_index == e9k_clock_count) {
+                         e9k_debug_pause();
+@@ -5384,7 +5469,7 @@
+                     }
+                     put_long(e9k_clock_address, e9k_clock_values[e9k_clock_index++]);
+                 }
+-                if (e9k_pc_observer && r->instruction_pc == e9k_pc_observer_address)
++                if (e9k_pc_observer && e9k_pc_observer_matches(r->instruction_pc))
+                     e9k_pc_observer(r->instruction_pc, (uint32_t)r->opcode);
+                 if (e9k_recomp_executor) {
+                     if (!e9k_recomp_instruction()) { exit = true; continue; }

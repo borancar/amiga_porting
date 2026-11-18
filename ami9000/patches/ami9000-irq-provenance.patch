@@ -1,0 +1,59 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -9559,6 +9559,10 @@
+ // external delayed interrupt
+ void INTREQ_INT(int num, int delay)
+ {
++#ifdef CPUEMU_13
++    extern void e9k_checkpoint_log_irq_source(int num, int delay, void *caller);
++    e9k_checkpoint_log_irq_source(num, delay, __builtin_return_address(0));
++#endif
+ 	if (m68k_interrupt_delay) {
+ 		if (delay < CYCLE_UNIT) {
+ 			delay *= CYCLE_UNIT;
+@@ -17505,11 +17509,20 @@
+     return row;
+ }
+ 
+-void e9k_checkpoint_log_irq(int stage, int level)
++void e9k_checkpoint_log_irq_source(int num, int delay, void *caller)
++{
++    struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(9,
++        (uae_u32)(uintptr_t)caller, num, delay);
++    if (row) row->value = (uae_u32)(((uae_u64)(uintptr_t)caller) >> 32);
++}
++
++void e9k_checkpoint_log_irq(int stage, int level, void *caller)
+ {
+     struct e9k_checkpoint_bus_row *row = checkpoint_bus_begin(stage,
+         ((uae_u32)intena << 16) | intreq, regs.ipl_pin, regs.ipl_evt_pre_mode);
+     if (row) row->value = level;
++    row = checkpoint_bus_begin(8, (uae_u32)(uintptr_t)caller, stage, level);
++    if (row) row->value = (uae_u32)(((uae_u64)(uintptr_t)caller) >> 32);
+ }
+ 
+ void e9k_checkpoint_log_exception(int nr)
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -4663,8 +4663,8 @@
+ static void update_ipl(int ipl)
+ {
+ #ifdef CPUEMU_13
+-    extern void e9k_checkpoint_log_irq(int stage, int level);
+-    e9k_checkpoint_log_irq(7, ipl);
++    extern void e9k_checkpoint_log_irq(int stage, int level, void *caller);
++    e9k_checkpoint_log_irq(7, ipl, __builtin_return_address(0));
+ #endif
+ 	evt_t c = get_cycles();
+ 	regs.ipl_pin_change_evt_p = regs.ipl_pin_change_evt;
+@@ -4704,8 +4704,8 @@
+ #endif
+ 	int ipl = intlev();
+ #ifdef CPUEMU_13
+-    extern void e9k_checkpoint_log_irq(int stage, int level);
+-    e9k_checkpoint_log_irq(6, ipl);
++    extern void e9k_checkpoint_log_irq(int stage, int level, void *caller);
++    e9k_checkpoint_log_irq(6, ipl, __builtin_return_address(0));
+ #endif
+ 
+ 	if (regs.ipl_pin != ipl) {

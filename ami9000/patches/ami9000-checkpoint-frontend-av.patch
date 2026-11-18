@@ -1,0 +1,227 @@
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -209,6 +209,7 @@
+ bool request_reset_soft = false;
+ bool request_reset_hard = false;
+ static unsigned char request_init_custom_timer = 0;
++static uint8_t libretro_old_frame = 0;
+ unsigned char crop_id = 0;
+ unsigned char opt_crop_id = 0;
+ unsigned char crop_mode_id = 0;
+@@ -8889,7 +8890,6 @@
+ 
+ void retro_run(void)
+ {
+-   static uint8_t old_frame = 0;
+ 
+    /* Core options */
+    bool updated = false;
+@@ -8903,7 +8903,7 @@
+ #if E9K_HACK_DEBUGGER_HOST
+    if (e9k_debug_is_paused())
+    {
+-      old_frame = 1;
++      libretro_old_frame = 1;
+       video_cb(NULL, retrow_crop, retroh_crop, retrow << (pix_bytes >> 1));
+       output_audio_buffer.size = 0;
+       upload_output_audio_buffer();
+@@ -8948,13 +8948,13 @@
+       reset_drawing();
+ 
+       if (request_init_custom_timer > 1)
+-         old_frame++;
++         libretro_old_frame++;
+    }
+ 
+    /* Dynamic resolution changing requires a frame breather after reset_drawing() */
+    if (request_init_custom_timer > 0)
+    {
+-      old_frame++;
++      libretro_old_frame++;
+       request_init_custom_timer--;
+       if (request_init_custom_timer == 0)
+          init_custom();
+@@ -8970,7 +8970,7 @@
+ 			retroy_crop,
+ 			retroh,
+ 			request_update_av_info ? 1 : 0,
+-			old_frame,
++			libretro_old_frame,
+ 			request_init_custom_timer,
+ 			defaultw,
+ 			defaulth,
+@@ -9010,19 +9010,19 @@
+ 
+ #if E9K_HACK_DEBUGGER_HOST
+    e9k_vblank_notify();
+-   video_cb((old_frame || e9k_debug_is_paused()) ? NULL : retro_bmp + retro_bmp_offset, retrow_crop, retroh_crop, retrow << (pix_bytes >> 1));
++   video_cb((libretro_old_frame || e9k_debug_is_paused()) ? NULL : retro_bmp + retro_bmp_offset, retrow_crop, retroh_crop, retrow << (pix_bytes >> 1));
+    e9k_debug_amiga_on_video_presented();
+    if (e9k_debug_is_paused())
+    {
+       output_audio_buffer.size = 0;
+    }
+ #else
+-   video_cb(old_frame ? NULL : retro_bmp + retro_bmp_offset, retrow_crop, retroh_crop, retrow << (pix_bytes >> 1));
++   video_cb(libretro_old_frame ? NULL : retro_bmp + retro_bmp_offset, retrow_crop, retroh_crop, retrow << (pix_bytes >> 1));
+ #endif
+    upload_output_audio_buffer();
+ 
+-   if (old_frame)
+-      old_frame--;
++   if (libretro_old_frame)
++      libretro_old_frame--;
+ 
+    if (request_reset_soft)
+       retro_reset_soft();
+@@ -9284,6 +9284,60 @@
+    return 0;
+ }
+ 
++/* Pending frontend work can alter guest beam timing on a later retro_run. */
++static struct {
++    bool valid;
++    uint8_t timer, reset, update, old_frame;
++    uint32_t changed, changed_flags;
++} libretro_av_checkpoint;
++
++void libretro_av_checkpoint_clear(void)
++{
++    libretro_av_checkpoint.valid = false;
++}
++
++uae_u8 *save_libretro_av_checkpoint(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 16);
++    uae_u8 *dst = dstbak;
++    save_u32(1);
++    save_u8(request_init_custom_timer);
++    save_u8(request_reset_drawing ? 1 : 0);
++    save_u8(request_update_av_info ? 1 : 0);
++    save_u8(libretro_old_frame);
++    save_u32((uae_u32)config_changed);
++    save_u32((uae_u32)config_changed_flags);
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_libretro_av_checkpoint(uae_u8 *src)
++{
++    libretro_av_checkpoint.valid = false;
++    if (restore_u32() != 1) return src;
++    libretro_av_checkpoint.timer = restore_u8();
++    libretro_av_checkpoint.reset = restore_u8();
++    libretro_av_checkpoint.update = restore_u8();
++    libretro_av_checkpoint.old_frame = restore_u8();
++    libretro_av_checkpoint.changed = restore_u32();
++    libretro_av_checkpoint.changed_flags = restore_u32();
++    libretro_av_checkpoint.valid = true;
++    return src;
++}
++
++bool libretro_av_checkpoint_finish(void)
++{
++    if (!libretro_av_checkpoint.valid) return false;
++    request_init_custom_timer = libretro_av_checkpoint.timer;
++    request_reset_drawing = libretro_av_checkpoint.reset != 0;
++    request_update_av_info = libretro_av_checkpoint.update != 0;
++    libretro_old_frame = libretro_av_checkpoint.old_frame;
++    config_changed = (uae_s32)libretro_av_checkpoint.changed;
++    config_changed_flags = (uae_s32)libretro_av_checkpoint.changed_flags;
++    libretro_av_checkpoint.valid = false;
++    return true;
++}
++
+ #if E9K_HACK_DEBUGGER_HOST && E9K_HACK_DEBUGGER_RUNTIME
+ static uint32_t e9k_snapshot_be32(const uint8_t *p)
+ {
+@@ -9298,6 +9352,7 @@
+     size_t offset = 0;
+     bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
++    bool av_seen = false;
+     const uint8_t *scheduler_payload = NULL, *timing_payload = NULL, *bus_payload = NULL;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+@@ -9323,6 +9378,11 @@
+                 if (payload[84 + i * 17] > 1) return false;
+             timing_seen = true;
+             timing_payload = payload;
++        }
++        if (!memcmp(chunk, "LRAV", 4)) {
++            if (av_seen || payload_size != 16 || e9k_snapshot_be32(payload) != 1 ||
++                payload[5] > 1 || payload[6] > 1) return false;
++            av_seen = true;
+         }
+         if (!memcmp(chunk, "CHBS", 4)) {
+             if (bus_payload || payload_size != 849 || e9k_snapshot_be32(payload) != 1 ||
+@@ -9354,6 +9414,7 @@
+     if (scheduler_payload && (!timing_payload || memcmp(scheduler_payload + 4, timing_payload + 68, 8)))
+         return false;
+     if (bus_payload && (!timing_payload || !scheduler_payload)) return false;
++    if (av_seen && (!timing_payload || !scheduler_payload || !bus_payload)) return false;
+     libretro_restore_scheduler = scheduler_payload != NULL;
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+@@ -9362,6 +9423,7 @@
+     if (ok && timing_seen) ok = custom_checkpoint_timing_finish();
+     if (ok && scheduler_payload) ok = event_scheduler_checkpoint_finish();
+     if (ok && bus_payload) ok = custom_checkpoint_bus_finish();
++    if (ok && av_seen) ok = libretro_av_checkpoint_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,12 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("CHBS")))
++		else if (!_tcscmp (name, _T("LRAV"))) {
++#ifdef __LIBRETRO__
++            end = restore_libretro_av_checkpoint(chunk);
++#endif
++        }
++        else if (!_tcscmp (name, _T("CHBS")))
+             end = restore_custom_checkpoint_bus(chunk);
+         else if (!_tcscmp (name, _T("EVSC")))
+             end = restore_event_scheduler_checkpoint(chunk);
+@@ -1296,6 +1301,12 @@
+ 		xfree(dst);
+ 	}
+ 
++#ifdef __LIBRETRO__
++    dst = save_libretro_av_checkpoint(&len, 0);
++    save_chunk(f, dst, len, _T("LRAV"), 0);
++    xfree(dst);
++#endif
++
+     dst = save_custom_checkpoint_bus(&len, 0);
+     save_chunk(f, dst, len, _T("CHBS"), 0);
+     xfree(dst);
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16530,6 +16530,9 @@
+ {
+     checkpoint_timing.valid = false;
+     checkpoint_bus.valid = false;
++#ifdef __LIBRETRO__
++    libretro_av_checkpoint_clear();
++#endif
+     event_scheduler_checkpoint_clear();
+ 	memset(&cop_state, 0, sizeof(cop_state));
+ 	cop_state.state = COP_stop;
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -312,3 +312,10 @@
+ extern uae_u8 *save_custom_checkpoint_bus(size_t *len, uae_u8 *dstptr);
+ extern uae_u8 *restore_custom_checkpoint_bus(uae_u8 *src);
+ extern bool custom_checkpoint_bus_finish(void);
++
++#ifdef __LIBRETRO__
++extern void libretro_av_checkpoint_clear(void);
++extern uae_u8 *save_libretro_av_checkpoint(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_libretro_av_checkpoint(uae_u8 *src);
++extern bool libretro_av_checkpoint_finish(void);
++#endif

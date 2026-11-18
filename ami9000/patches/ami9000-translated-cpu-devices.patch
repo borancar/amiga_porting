@@ -1,0 +1,151 @@
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -5129,6 +5129,105 @@
+ 
+ #endif /* CPUEMU_11 */
+ 
++
++#if E9K_HACK_DEBUGGER_RUNTIME
++#include "e9k_recomp.h"
++#ifdef _WIN32
++#define E9K_RECOMP_EXPORT __declspec(dllexport)
++#else
++#define E9K_RECOMP_EXPORT __attribute__((visibility("default")))
++#endif
++static arecomp_original_execute e9k_recomp_executor;
++static bool e9k_recomp_active;
++static uint32_t e9k_recomp_bus_clocks;
++
++E9K_RECOMP_EXPORT int e9k_recomp_set_executor(uint32_t abi, arecomp_original_execute executor)
++{
++    if (abi != ARECOMP_ORIGINAL_DEVICES_ABI || e9k_recomp_active || !e9k_debug_is_paused())
++        return 0;
++    if (executor && (currprefs.cpu_model != 68000 || !currprefs.cpu_cycle_exact || cpu_tracer))
++        return 0;
++    e9k_recomp_executor = executor;
++    return 1;
++}
++
++E9K_RECOMP_EXPORT uint32_t e9k_recomp_read(uint32_t address, uint32_t bits)
++{
++    if (!e9k_recomp_active) return 0xffffffffu;
++    address &= 0x00ffffffu;
++    if (bits == ARECOMP_ORIGINAL_INSPECT_BYTE) return get_byte_debug(address);
++    if (bits == 8) { e9k_recomp_bus_clocks += 4; return x_get_byte(address); }
++    if (bits == 16) { e9k_recomp_bus_clocks += 4; return x_get_word(address); }
++    if (bits == 32) { e9k_recomp_bus_clocks += 8; return x_get_long(address); }
++    return 0xffffffffu;
++}
++
++E9K_RECOMP_EXPORT void e9k_recomp_write(uint32_t address, uint32_t value, uint32_t bits)
++{
++    if (!e9k_recomp_active) return;
++    address &= 0x00ffffffu;
++    if (bits == 8) { e9k_recomp_bus_clocks += 4; x_put_byte(address, value); }
++    else if (bits == 16) { e9k_recomp_bus_clocks += 4; x_put_word(address, value); }
++    else if (bits == 32) { e9k_recomp_bus_clocks += 8; x_put_long(address, value); }
++}
++
++/* Original core owns RAM/devices. Callback owns exactly this instruction.
++ * Original CE bus accesses plus remaining nominal internal clocks are development semantics;
++ * frame comparison must qualify them. No original instruction fallback.
++ */
++static bool e9k_recomp_instruction(void)
++{
++    arecomp_original_cpu cpu;
++    int result;
++    uint32_t previous_pc = m68k_getpc();
++    MakeSR();
++    memcpy(cpu.regs, regs.regs, sizeof(cpu.regs));
++    cpu.pc = m68k_getpc();
++    cpu.sr = regs.sr;
++    cpu.usp = regs.usp;
++    cpu.ssp = regs.isp;
++    cpu.cycles = 0;
++    cpu.stopped = 0;
++    cpu.length = 0;
++    e9k_recomp_bus_clocks = 0;
++    e9k_recomp_active = true;
++    result = e9k_recomp_executor(&cpu);
++    e9k_recomp_active = false;
++    if (result != 1 || cpu.cycles < 1 || cpu.cycles > 4096 || (cpu.pc & 1) || cpu.pc > 0xffffffu ||
++        cpu.length < 2 || cpu.length > 10 || (cpu.length & 1)) {
++        e9k_debug_pause();
++        return false;
++    }
++    /* MakeFromSR may swap stacks; install the callback's final registers AFTER it. */
++    regs.sr = cpu.sr;
++    MakeFromSR();
++    memcpy(regs.regs, cpu.regs, sizeof(cpu.regs));
++    regs.usp = cpu.usp;
++    regs.isp = cpu.ssp;
++    m68k_setpc(cpu.stopped ? previous_pc : cpu.pc);
++    if (!cpu.stopped) {
++        /* Straight-line execution consumes each extension and one refill word.
++         * A redirected PC refills both prefetch words. Bus helpers retain DMA
++         * contention; subtract only nominal bus clocks from the CPU estimate.
++         * Access ordering within an instruction remains a development limit.
++         */
++        uint32_t words = cpu.pc == ((previous_pc + cpu.length) & 0xffffffu) ? cpu.length / 2 : 2;
++        uint32_t address = words == cpu.length / 2 && cpu.pc == ((previous_pc + cpu.length) & 0xffffffu)
++            ? previous_pc + 4 : cpu.pc;
++        for (uint32_t i = 0; i < words; ++i) {
++            regs.irc = x_get_word((address + i * 2) & 0xffffffu);
++            e9k_recomp_bus_clocks += 4;
++        }
++        regs.ir = get_word_debug(cpu.pc);
++    }
++    if (cpu.cycles > e9k_recomp_bus_clocks)
++        x_do_cycles((cpu.cycles - e9k_recomp_bus_clocks) * (CYCLE_UNIT / 2));
++    ipl_fetch_now();
++    if (cpu.stopped) m68k_setstopped(1);
++    return true;
++}
++#endif
++
+ #ifndef CPUEMU_13
+ 
+ static void m68k_run_1_ce (void)
+@@ -5233,6 +5332,11 @@
+ 					}
+ #endif
+ 
++#if E9K_HACK_DEBUGGER_RUNTIME
++                if (e9k_recomp_executor) {
++                    if (!e9k_recomp_instruction()) { exit = true; continue; }
++                } else
++#endif
+ 				(*cpufunctbl_noret[r->opcode])(r->opcode);
+ 				if (!regs.loop_mode)
+ 					regs.ird = regs.opcode;
+--- /dev/null
++++ b/ami9000/libretro/e9k_recomp.h
+@@ -0,0 +1,28 @@
++/* Versioned C ABI for translated CPU execution with original UAE devices.
++ * A successful callback executes exactly one instruction. Missing/changed code
++ * must return -1: the core pauses without executing its original CPU handler.
++ * Memory callbacks are valid only during execute(), on the core's thread.
++ */
++#ifndef ARECOMP_ORIGINAL_DEVICES_H
++#define ARECOMP_ORIGINAL_DEVICES_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define ARECOMP_ORIGINAL_DEVICES_ABI 2u
++/* Inspection reads validate code bytes without issuing a guest bus access. */
++#define ARECOMP_ORIGINAL_INSPECT_BYTE 0x108u
++typedef struct arecomp_original_cpu {
++    uint32_t regs[16];
++    uint32_t pc, sr, usp, ssp;
++    uint32_t cycles; /* output: nominal CPU clocks for this instruction */
++    uint32_t stopped;
++    uint32_t length; /* output: bytes in the translated instruction */
++} arecomp_original_cpu;
++typedef int (*arecomp_original_execute)(arecomp_original_cpu *cpu);
++typedef uint32_t (*arecomp_original_read)(uint32_t address, uint32_t bits);
++typedef void (*arecomp_original_write)(uint32_t address, uint32_t value, uint32_t bits);
++#ifdef __cplusplus
++}
++#endif
++#endif

@@ -1,0 +1,144 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16514,6 +16514,13 @@
+  * complete chipset checkpoint: display/DMA pipeline ownership is separate. */
+ static struct {
+     bool valid;
++    uae_u8 slots[272], last;
++    uae_u16 pipe[272];
++    uae_s32 counters[6];
++} checkpoint_bus;
++
++static struct {
++    bool valid;
+     uae_s32 beam[12];
+     evt_t line_start, vsync, cycle, next;
+     struct ev primary[ev_max];
+@@ -16522,6 +16529,7 @@
+ void restore_custom_start(void)
+ {
+     checkpoint_timing.valid = false;
++    checkpoint_bus.valid = false;
+     event_scheduler_checkpoint_clear();
+ 	memset(&cop_state, 0, sizeof(cop_state));
+ 	cop_state.state = COP_stop;
+@@ -17917,3 +17925,46 @@
+     eventtab2[slot].handler = id ? saved_custom_event_handlers[id] : NULL;
+ }
+ #endif
++
++#ifdef SAVESTATE
++uae_u8 *save_custom_checkpoint_bus(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 849);
++    uae_u8 *dst = dstbak;
++    const int counters[6] = {extra_cycle, line_cyclebased, last_decide_line_hpos,
++        last_fetch_hpos, last_decide_sprite_hpos, last_copper_hpos};
++    save_u32(1);
++    save_u32(272);
++    for (int i = 0; i < 272; ++i) save_u8(cycle_line_slot[i]);
++    for (int i = 0; i < 272; ++i) save_u16(cycle_line_pipe[i]);
++    save_u8(cycle_line_slot_last);
++    for (int i = 0; i < 6; ++i) save_u32((uae_u32)counters[i]);
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_custom_checkpoint_bus(uae_u8 *src)
++{
++    checkpoint_bus.valid = false;
++    if (restore_u32() != 1 || restore_u32() != 272) return src;
++    for (int i = 0; i < 272; ++i) checkpoint_bus.slots[i] = restore_u8();
++    for (int i = 0; i < 272; ++i) checkpoint_bus.pipe[i] = restore_u16();
++    checkpoint_bus.last = restore_u8();
++    for (int i = 0; i < 6; ++i) checkpoint_bus.counters[i] = (uae_s32)restore_u32();
++    checkpoint_bus.valid = true;
++    return src;
++}
++
++bool custom_checkpoint_bus_finish(void)
++{
++    if (!checkpoint_bus.valid) return false;
++    int *counters[6] = {&extra_cycle, &line_cyclebased, &last_decide_line_hpos,
++        &last_fetch_hpos, &last_decide_sprite_hpos, &last_copper_hpos};
++    memcpy(cycle_line_slot, checkpoint_bus.slots, sizeof(checkpoint_bus.slots));
++    memcpy(cycle_line_pipe, checkpoint_bus.pipe, sizeof(checkpoint_bus.pipe));
++    cycle_line_slot_last = checkpoint_bus.last;
++    for (int i = 0; i < 6; ++i) *counters[i] = checkpoint_bus.counters[i];
++    checkpoint_bus.valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -308,3 +308,7 @@
+ extern uae_u8 *save_event_scheduler_checkpoint(size_t *len, uae_u8 *dstptr);
+ extern uae_u8 *restore_event_scheduler_checkpoint(uae_u8 *src);
+ extern bool event_scheduler_checkpoint_finish(void);
++
++extern uae_u8 *save_custom_checkpoint_bus(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_custom_checkpoint_bus(uae_u8 *src);
++extern bool custom_checkpoint_bus_finish(void);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,9 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("EVSC")))
++		else if (!_tcscmp (name, _T("CHBS")))
++            end = restore_custom_checkpoint_bus(chunk);
++        else if (!_tcscmp (name, _T("EVSC")))
+             end = restore_event_scheduler_checkpoint(chunk);
+         else if (!_tcscmp (name, _T("CHTM")))
+             end = restore_custom_checkpoint_timing(chunk);
+@@ -1294,6 +1296,10 @@
+ 		xfree(dst);
+ 	}
+ 
++    dst = save_custom_checkpoint_bus(&len, 0);
++    save_chunk(f, dst, len, _T("CHBS"), 0);
++    xfree(dst);
++
+     dst = save_event_scheduler_checkpoint(&len, 0);
+     save_chunk(f, dst, len, _T("EVSC"), 0);
+     xfree(dst);
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -9298,7 +9298,7 @@
+     size_t offset = 0;
+     bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
+-    const uint8_t *scheduler_payload = NULL, *timing_payload = NULL;
++    const uint8_t *scheduler_payload = NULL, *timing_payload = NULL, *bus_payload = NULL;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+     while (offset <= size - 8) {
+@@ -9324,6 +9324,11 @@
+             timing_seen = true;
+             timing_payload = payload;
+         }
++        if (!memcmp(chunk, "CHBS", 4)) {
++            if (bus_payload || payload_size != 849 || e9k_snapshot_be32(payload) != 1 ||
++                e9k_snapshot_be32(payload + 4) != 272) return false;
++            bus_payload = payload;
++        }
+         if (!memcmp(chunk, "EVSC", 4)) {
+             if (scheduler_payload || payload_size != 194 || e9k_snapshot_be32(payload) != 1 ||
+                 payload[12] < 1 || payload[12] >= 12 ||
+@@ -9348,6 +9353,7 @@
+         return false;
+     if (scheduler_payload && (!timing_payload || memcmp(scheduler_payload + 4, timing_payload + 68, 8)))
+         return false;
++    if (bus_payload && (!timing_payload || !scheduler_payload)) return false;
+     libretro_restore_scheduler = scheduler_payload != NULL;
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+@@ -9355,6 +9361,7 @@
+     libretro_restore_scheduler = false;
+     if (ok && timing_seen) ok = custom_checkpoint_timing_finish();
+     if (ok && scheduler_payload) ok = event_scheduler_checkpoint_finish();
++    if (ok && bus_payload) ok = custom_checkpoint_bus_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;

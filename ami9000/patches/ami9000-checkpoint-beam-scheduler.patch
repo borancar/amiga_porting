@@ -1,0 +1,175 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16510,8 +16510,18 @@
+ 	}
+ }
+ 
++/* Versioned diagnostic beam/primary-scheduler checkpoint. This is not a
++ * complete chipset checkpoint: display/DMA pipeline ownership is separate. */
++static struct {
++    bool valid;
++    uae_s32 beam[12];
++    evt_t line_start, vsync, cycle, next;
++    struct ev primary[ev_max];
++} checkpoint_timing;
++
+ void restore_custom_start(void)
+ {
++    checkpoint_timing.valid = false;
+ 	memset(&cop_state, 0, sizeof(cop_state));
+ 	cop_state.state = COP_stop;
+ }
+@@ -17817,3 +17827,76 @@
+ 	decide_line(hpos);
+ 	decide_fetch_safe(hpos);
+ }
++
++#ifdef SAVESTATE
++bool custom_checkpoint_timing_supported(void)
++{
++    const evfunc handlers[ev_max] = {
++        CIA_handler, hsync_handler, hsync_handlerh, MISC_handler, audio_evhandler2
++    };
++    for (int i = 0; i < ev_max; ++i)
++        if (eventtab[i].handler != handlers[i]) return false;
++    return true;
++}
++
++uae_u8 *save_custom_checkpoint_timing(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 169);
++    uae_u8 *dst = dstbak;
++    const int beam[12] = {vpos, vpos_prev, vposh, linear_vpos,
++        vpos_count, vpos_count_diff, lof_store, lof_display, lol, lol_prev,
++        maxhpos, maxvpos};
++    save_u32(1);
++    for (int i = 0; i < 12; ++i) save_u32((uae_u32)beam[i]);
++    save_u64(line_start_cycles);
++    save_u64(vsync_cycles);
++    save_u64(get_cycles());
++    save_u64(nextevent);
++    for (int i = 0; i < ev_max; ++i) {
++        save_u8(eventtab[i].active ? 1 : 0);
++        save_u64(eventtab[i].evtime);
++        save_u64(eventtab[i].oldcycles);
++    }
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_custom_checkpoint_timing(uae_u8 *src)
++{
++    checkpoint_timing.valid = false;
++    if (restore_u32() != 1) return src;
++    for (int i = 0; i < 12; ++i) checkpoint_timing.beam[i] = (uae_s32)restore_u32();
++    checkpoint_timing.line_start = restore_u64();
++    checkpoint_timing.vsync = restore_u64();
++    checkpoint_timing.cycle = restore_u64();
++    checkpoint_timing.next = restore_u64();
++    for (int i = 0; i < ev_max; ++i) {
++        checkpoint_timing.primary[i].active = restore_u8() != 0;
++        checkpoint_timing.primary[i].evtime = restore_u64();
++        checkpoint_timing.primary[i].oldcycles = restore_u64();
++    }
++    checkpoint_timing.valid = true;
++    return src;
++}
++
++bool custom_checkpoint_timing_finish(void)
++{
++    if (!checkpoint_timing.valid || !custom_checkpoint_timing_supported() ||
++        checkpoint_timing.cycle != get_cycles() ||
++        checkpoint_timing.beam[10] != maxhpos || checkpoint_timing.beam[11] != maxvpos)
++        return false;
++    int *beam[10] = {&vpos, &vpos_prev, &vposh, &linear_vpos,
++        &vpos_count, &vpos_count_diff, &lof_store, &lof_display, &lol, &lol_prev};
++    for (int i = 0; i < 10; ++i) *beam[i] = checkpoint_timing.beam[i];
++    line_start_cycles = checkpoint_timing.line_start;
++    vsync_cycles = checkpoint_timing.vsync;
++    for (int i = 0; i < ev_max; ++i) {
++        eventtab[i].active = checkpoint_timing.primary[i].active;
++        eventtab[i].evtime = checkpoint_timing.primary[i].evtime;
++        eventtab[i].oldcycles = checkpoint_timing.primary[i].oldcycles;
++    }
++    nextevent = checkpoint_timing.next;
++    checkpoint_timing.valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -295,3 +295,8 @@
+ extern void savestate_capture_request(void);
+ 
+ #endif /* UAE_SAVESTATE_H */
++
++extern bool custom_checkpoint_timing_supported(void);
++extern uae_u8 *save_custom_checkpoint_timing(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_custom_checkpoint_timing(uae_u8 *src);
++extern bool custom_checkpoint_timing_finish(void);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,9 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("CHSL")))
++		else if (!_tcscmp (name, _T("CHTM")))
++            end = restore_custom_checkpoint_timing(chunk);
++        else if (!_tcscmp (name, _T("CHSL")))
+ 			end = restore_custom_slots (chunk);
+ 		else if (!_tcscmp (name, _T("AUD0")))
+ 			end = restore_audio (0, chunk);
+@@ -1290,6 +1292,10 @@
+ 		xfree(dst);
+ 	}
+ 
++    dst = save_custom_checkpoint_timing(&len, 0);
++    save_chunk(f, dst, len, _T("CHTM"), 0);
++    xfree(dst);
++
+ 	/* add fake END tag, makes it easy to strip CONF and LOG hunks */
+ 	/* move this if you want to use CONF or LOG hunks when restoring state */
+ 	zfile_fwrite (endhunk, 1, 8, f);
+@@ -1343,7 +1349,7 @@
+ 		}
+ 	}
+ #ifdef __LIBRETRO__
+-    if (!custom_event_delay_save_supported())
++    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported())
+         return NULL;
+ #endif
+ 	new_blitter = false;
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -9295,7 +9295,7 @@
+ {
+     const uint8_t *bytes = (const uint8_t *)data;
+     size_t offset = 0;
+-    bool cpu_seen = false, ended = false;
++    bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+@@ -9314,6 +9314,13 @@
+             expected_pc = e9k_snapshot_be32(payload + 68);
+             cpu_seen = true;
+         }
++        if (!memcmp(chunk, "CHTM", 4)) {
++            if (timing_seen || payload_size != 169 || e9k_snapshot_be32(payload) != 1)
++                return false;
++            for (unsigned int i = 0; i < 5; ++i)
++                if (payload[84 + i * 17] > 1) return false;
++            timing_seen = true;
++        }
+         if (!memcmp(chunk, "CHPD", 4)) {
+             if (payload_size < 5 || e9k_snapshot_be32(payload) != 1 || payload_size != 5u + payload[4] * 13u)
+                 return false;
+@@ -9328,6 +9335,7 @@
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+     libretro_restore_exact = false;
++    if (ok && timing_seen) ok = custom_checkpoint_timing_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;

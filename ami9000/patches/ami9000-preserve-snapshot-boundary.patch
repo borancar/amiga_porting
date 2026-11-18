@@ -1,0 +1,374 @@
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -17203,125 +17203,83 @@
+ 	return src;
+ }
+ 
++/* Stable wire IDs; never invoke pending handlers while serializing them. */
++static const evfunc2 saved_custom_event_handlers[] = {
++    NULL, event_send_interrupt_do_ext, event_doint_delay_do_ext,
++    event_audxdat_func, event_setdsr, event_CIA_synced_interrupt,
++    event_doint_delay_do_intreq, event_doint_delay_do_intena,
++    event_CIA_tod_inc_event, event_DISK_handler, bitplane_dma_change,
++    events_dmal_hsync2
++};
++
++bool custom_event_delay_type_supported(unsigned int type)
++{
++    return type > 0 && type < sizeof(saved_custom_event_handlers) / sizeof(saved_custom_event_handlers[0]);
++}
++
++static uae_u8 custom_event_delay_type(evfunc2 handler)
++{
++    for (unsigned int type = 1; custom_event_delay_type_supported(type); ++type)
++        if (saved_custom_event_handlers[type] == handler)
++            return (uae_u8)type;
++    return 0;
++}
++
++bool custom_event_delay_save_supported(void)
++{
++    for (int i = ev2_misc; i < ev2_max; ++i) {
++        if (eventtab2[i].active && !custom_event_delay_type(eventtab2[i].handler)) {
++            write_log("snapshot rejected: unsupported pending event2 handler %p\n", eventtab2[i].handler);
++            return false;
++        }
++    }
++    return true;
++}
++
+ uae_u8 *restore_custom_event_delay(uae_u8 *src)
+ {
+-	if (restore_u32() != 1)
+-		return src;
+-
+-	int cnt = restore_u8();
+-	for (int i = 0; i < cnt; i++) {
+-		uae_u8 type = restore_u8();
+-		evt_t e = restore_u64();
+-		uae_u32 data = restore_u32();
+-		evfunc2 f = NULL;
+-		switch(type)
+-		{
+-			case 1:
+-				f = event_send_interrupt_do_ext;
+-				break;
+-			case 2:
+-				f = event_doint_delay_do_ext;
+-				break;
+-			case 3:
+-				f = event_audxdat_func;
+-				break;
+-			case 4:
+-				f = event_setdsr;
+-				break;
+-			case 5:
+-				f = event_CIA_synced_interrupt;
+-				break;
+-			case 6:
+-				f = event_doint_delay_do_intreq;
+-				break;
+-			case 7:
+-				f = event_doint_delay_do_intena;
+-				break;
+-			case 8:
+-				f = event_CIA_tod_inc_event;
+-				break;
+-			case 9:
+-				f = event_DISK_handler;
+-				break;
+-			case 10:
+-				f = bitplane_dma_change;
+-				break;
+-			case 0:
+-				write_log("ignored event type %d (%08x) restored\n", type, data);
+-				break;
+-			default:
+-				write_log("unknown event type %d (%08x) restored\n", type, data);
+-				break;
+-		}
+-		if (f) {
+-			event2_newevent_xx(-1, e, data, f);
+-		}
+-	}
+-	return src;
+-}
++    if (restore_u32() != 1)
++        return src;
++    int cnt = restore_u8();
++    for (int i = 0; i < cnt; ++i) {
++        uae_u8 type = restore_u8();
++        evt_t delay = restore_u64();
++        uae_u32 data = restore_u32();
++        if (custom_event_delay_type_supported(type))
++            event2_newevent_xx(-1, delay, data, saved_custom_event_handlers[type]);
++        else
++            write_log("unsupported legacy event type %d (%08x) restored\n", type, data);
++    }
++    return src;
++}
++
+ uae_u8 *save_custom_event_delay(size_t *len, uae_u8 *dstptr)
+ {
+-	uae_u8 *dstbak, *dst;
+-	int cnt = 0, cnt2 = 0;
+-
+-	for (int i = ev2_misc; i < ev2_max; i++) {
+-		struct ev2 *e = &eventtab2[i];
+-		if (e->active) {
+-			cnt++;
+-		}
+-	}
+-	if (cnt == 0)
+-		return NULL;
+-
+-	if (dstptr)
+-		dstbak = dst = dstptr;
+-	else
+-		dstbak = dst = xmalloc(uae_u8, 1000);
+-
+-	save_u32(1);
+-	save_u8(cnt);
+-	for (int i = ev2_misc; i < ev2_max; i++) {
+-		struct ev2 *e = &eventtab2[i];
+-		if (e->active) {
+-			evfunc2 f = e->handler;
+-			uae_u8 type = 0;
+-			if (f == event_send_interrupt_do_ext) {
+-				type = 1;
+-			} else if (f == event_doint_delay_do_ext) {
+-				type = 2;
+-			} else if (f == event_audxdat_func) {
+-				type = 3;
+-			} else if (f == event_setdsr) {
+-				type = 4;
+-			} else if (f == event_CIA_synced_interrupt) {
+-				type = 5;
+-			} else if (f == event_doint_delay_do_intreq) {
+-				type = 6;
+-			} else if (f == event_doint_delay_do_intena) {
+-				type = 7;
+-			} else if (f == event_CIA_tod_inc_event) {
+-				type = 8;
+-			} else if (f == event_DISK_handler) {
+-				type = 9;
+-			} else if (f == bitplane_dma_change) {
+-				type = 10;
+-			} else {
+-				write_log("unknown event2 handler %p\n", e->handler);
+-				e->active = false;
+-				f(e->data);
+-			}
+-			if (type) {
+-				cnt2++;
+-			}
+-			save_u8(type);
+-			save_u64(e->evtime - get_cycles());
+-			save_u32(e->data);
+-		}
+-	}
+-	write_log("%d pending events saved\n", cnt2);
+-
+-	*len = dst - dstbak;
+-	return dstbak;
++    if (!custom_event_delay_save_supported()) {
++        *len = (size_t)-1;
++        return NULL;
++    }
++    int count = 0;
++    for (int i = ev2_misc; i < ev2_max; ++i)
++        if (eventtab2[i].active) ++count;
++    if (!count) {
++        *len = 0;
++        return NULL;
++    }
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 5 + count * 13);
++    uae_u8 *dst = dstbak;
++    save_u32(1);
++    save_u8(count);
++    for (int i = ev2_misc; i < ev2_max; ++i) {
++        struct ev2 *event = &eventtab2[i];
++        if (event->active) {
++            save_u8(custom_event_delay_type(event->handler));
++            save_u64(event->evtime - get_cycles());
++            save_u32(event->data);
++        }
++    }
++    *len = dst - dstbak;
++    return dstbak;
+ }
+ 
+ 
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -111,6 +111,8 @@
+ 
+ extern uae_u8 *restore_custom_event_delay (uae_u8 *src);
+ extern uae_u8 *save_custom_event_delay(size_t *len, uae_u8 *dstptr);
++extern bool custom_event_delay_save_supported(void);
++extern bool custom_event_delay_type_supported(unsigned int type);
+ 
+ extern uae_u8 *restore_custom_slots(uae_u8 *src);
+ extern uae_u8 *save_custom_slots(size_t *len, uae_u8 *dstptr);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -1082,6 +1082,8 @@
+ 	xfree (dst);
+ 
+ 	dst = save_custom_event_delay (&len, 0);
++	if (!dst && len == (size_t)-1)
++		return 0;
+ 	save_chunk (f, dst, len, _T("CHPD"), 0);
+ 	xfree (dst);
+ 
+@@ -1340,6 +1342,10 @@
+ #endif
+ 		}
+ 	}
++#ifdef __LIBRETRO__
++    if (!custom_event_delay_save_supported())
++        return NULL;
++#endif
+ 	new_blitter = false;
+ 	savestate_nodialogs = 0;
+ 	custom_prepare_savestate ();
+@@ -1383,6 +1389,11 @@
+ 	}
+ 	int v = save_state_internal (f, description, comp, true);
+ #ifdef __LIBRETRO__
++    if (!v) {
++        zfile_fclose(f);
++        savestate_state = 0;
++        return NULL;
++    }
+ #if OPEN_LOG > 0
+ 	if (v)
+ 		write_log (_T("STATESAVE libretro serialization complete\n"));
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -26,6 +26,7 @@
+ 
+ #ifdef __LIBRETRO__
+ extern bool libretro_frame_end;
++extern bool libretro_restore_exact;
+ #endif
+ 
+ #include "options.h"
+@@ -3669,6 +3670,9 @@
+ 
+ 	regs.spcflags = 0;
+ 	m68k_reset_delay = 0;
++#if defined(__LIBRETRO__) && E9K_HACK_DEBUGGER_RUNTIME
++    if (!libretro_restore_exact)
++#endif
+ 	regs.ipl[0] = regs.ipl[1] = regs.ipl_pin = 0;
+ 	for (int i = 0; i < IRQ_SOURCE_MAX; i++) {
+ 		uae_interrupts2[i] = 0;
+@@ -7031,6 +7035,13 @@
+ 		if (restored) {
+ 			restored = 0;
+ 			savestate_restore_final();
++#if defined(__LIBRETRO__) && E9K_HACK_DEBUGGER_RUNTIME
++            if (libretro_restore_exact) {
++                e9k_debug_pause();
++                libretro_frame_end = false;
++                return 0;
++            }
++#endif
+ 		}
+ #endif
+ 
+@@ -7530,8 +7541,14 @@
+ 		fpu_reset();
+ 	init_m68k ();
+ 	m68k_setpc_normal (regs.pc);
++#if defined(__LIBRETRO__) && E9K_HACK_DEBUGGER_RUNTIME
++    if (!libretro_restore_exact) {
++#endif
+ 	doint ();
+ 	fill_prefetch_quick ();
++#if defined(__LIBRETRO__) && E9K_HACK_DEBUGGER_RUNTIME
++    }
++#endif
+ 	set_cycles (start_cycles);
+ 	events_schedule ();
+ 	//activate_debugger ();
+--- a/ami9000/sources/src/cia.c
++++ b/ami9000/sources/src/cia.c
+@@ -3032,7 +3032,7 @@
+ 	l = restore_u8();					/* TOD latched value */
+ 	l |= restore_u8() << 8;
+ 	l |= restore_u8() << 16;
+-	c->tol = w;
++	c->tol = l;
+ 	l = restore_u8();					/* alarm */
+ 	l |= restore_u8() << 8;
+ 	l |= restore_u8() << 16;
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -70,6 +70,7 @@
+ 
+ bool libretro_runloop_active = false;
+ bool libretro_frame_end = false;
++bool libretro_restore_exact = false;
+ unsigned short int retro_bmp[RETRO_BMP_SIZE] = {0};
+ unsigned int retro_bmp_offset = 0;
+ unsigned short int defaultw = EMULATOR_DEF_WIDTH / 2;
+@@ -9282,6 +9283,57 @@
+    return 0;
+ }
+ 
++#if E9K_HACK_DEBUGGER_HOST && E9K_HACK_DEBUGGER_RUNTIME
++static uint32_t e9k_snapshot_be32(const uint8_t *p)
++{
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++/* Exact debug restore supports the core's uncompressed 68000 machine prefix.
++ * Legacy type-0 events are irrecoverable, not inferred from their data. */
++RETRO_API bool e9k_debug_unserialize_at_saved_pc(const void *data, size_t size)
++{
++    const uint8_t *bytes = (const uint8_t *)data;
++    size_t offset = 0;
++    bool cpu_seen = false, ended = false;
++    uint32_t expected_pc = 0;
++    if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
++        return false;
++    while (offset <= size - 8) {
++        const uint8_t *chunk = bytes + offset;
++        uint32_t length = e9k_snapshot_be32(chunk + 4);
++        if (!memcmp(chunk, "\0\0\0\0", 4)) { offset += 4; continue; }
++        if (!memcmp(chunk, "END ", 4)) { ended = length == 8; break; }
++        if (length < 12 || length > size - offset || e9k_snapshot_be32(chunk + 8) != 0)
++            return false;
++        const uint8_t *payload = chunk + 12;
++        uint32_t payload_size = length - 12;
++        if (!memcmp(chunk, "CPU ", 4)) {
++            if (cpu_seen || payload_size != 156 || e9k_snapshot_be32(payload) != 68000)
++                return false;
++            expected_pc = e9k_snapshot_be32(payload + 68);
++            cpu_seen = true;
++        }
++        if (!memcmp(chunk, "CHPD", 4)) {
++            if (payload_size < 5 || e9k_snapshot_be32(payload) != 1 || payload_size != 5u + payload[4] * 13u)
++                return false;
++            for (unsigned int i = 0; i < payload[4]; ++i)
++                if (!custom_event_delay_type_supported(payload[5 + i * 13]))
++                    return false;
++        }
++        offset += ((size_t)length + 3) & ~(size_t)3;
++    }
++    if (!ended || !cpu_seen || savestate_state)
++        return false;
++    libretro_restore_exact = true;
++    bool ok = retro_unserialize(data, size);
++    libretro_restore_exact = false;
++    uint32_t registers[18];
++    return ok && !savestate_state && e9k_debug_is_paused() &&
++        e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;
++}
++#endif
++
+ void retro_cheat_reset(void) {}
+ 
+ void retro_cheat_set(unsigned index, bool enabled, const char *code)

@@ -1,0 +1,225 @@
+--- a/ami9000/sources/src/blitter.c
++++ b/ami9000/sources/src/blitter.c
+@@ -3179,8 +3179,12 @@
+ 
+ #ifdef SAVESTATE
+ 
++static bool checkpoint_blitter_cursor_valid;
++static int checkpoint_blitter_cursor;
++
+ void restore_blitter_start(void)
+ {
++    checkpoint_blitter_cursor_valid = false;
+ #if E9K_HACK_BLITTER_VIS
+ 	blitter_debugClearWrites();
+ #endif
+@@ -3527,3 +3531,38 @@
+ }
+ 
+ #endif /* SAVESTATE */
++
++#ifdef SAVESTATE
++bool blitter_checkpoint_cursor_supported(void)
++{
++    return last_blitter_hpos >= 0 && last_blitter_hpos <= (int)(sizeof(blitter_pipe) / sizeof(blitter_pipe[0]));
++}
++
++uae_u8 *save_blitter_checkpoint_cursor(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 8);
++    uae_u8 *dst = dstbak;
++    save_u32(1);
++    save_u32((uae_u32)last_blitter_hpos);
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_blitter_checkpoint_cursor(uae_u8 *src)
++{
++    checkpoint_blitter_cursor_valid = false;
++    if (restore_u32() != 1) return src;
++    checkpoint_blitter_cursor = (uae_s32)restore_u32();
++    checkpoint_blitter_cursor_valid = true;
++    return src;
++}
++
++bool blitter_checkpoint_cursor_finish(void)
++{
++    if (!checkpoint_blitter_cursor_valid || checkpoint_blitter_cursor < 0 ||
++        checkpoint_blitter_cursor > (int)(sizeof(blitter_pipe) / sizeof(blitter_pipe[0]))) return false;
++    last_blitter_hpos = checkpoint_blitter_cursor;
++    checkpoint_blitter_cursor_valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -16518,6 +16518,12 @@
+  * complete chipset checkpoint: display/DMA pipeline ownership is separate. */
+ static struct {
+     bool valid;
++    uae_s32 start_line, bogus, display_vsync;
++    bool flags[11];
++} checkpoint_vblank;
++
++static struct {
++    bool valid;
+     uae_u8 slots[272], last;
+     uae_u16 pipe[272];
+     uae_s32 counters[6];
+@@ -16534,6 +16540,7 @@
+ {
+     checkpoint_timing.valid = false;
+     checkpoint_bus.valid = false;
++    checkpoint_vblank.valid = false;
+ #ifdef __LIBRETRO__
+     libretro_av_checkpoint_clear();
+ #endif
+@@ -18047,3 +18054,47 @@
+     return true;
+ }
+ #endif
++
++#ifdef SAVESTATE
++uae_u8 *save_custom_checkpoint_vblank(size_t *len, uae_u8 *dstptr)
++{
++    uae_u8 *dstbak = dstptr ? dstptr : xmalloc(uae_u8, 27);
++    uae_u8 *dst = dstbak;
++    const bool flags[11] = {vb_state, vb_end_line, vb_end_next_line, vb_end_next_line2,
++        vsync_line, vsync_rendered, frame_rendered, frame_shown, vsync_display_rendered,
++        maxvpos_display_vsync_next, initial_frame};
++    save_u32(1);
++    save_u32((uae_u32)vb_start_line);
++    save_u32((uae_u32)bogusframe);
++    save_u32((uae_u32)maxvpos_display_vsync);
++    for (int i = 0; i < 11; ++i) save_u8(flags[i] ? 1 : 0);
++    *len = dst - dstbak;
++    return dstbak;
++}
++
++uae_u8 *restore_custom_checkpoint_vblank(uae_u8 *src)
++{
++    checkpoint_vblank.valid = false;
++    if (restore_u32() != 1) return src;
++    checkpoint_vblank.start_line = (uae_s32)restore_u32();
++    checkpoint_vblank.bogus = (uae_s32)restore_u32();
++    checkpoint_vblank.display_vsync = (uae_s32)restore_u32();
++    for (int i = 0; i < 11; ++i) checkpoint_vblank.flags[i] = restore_u8() != 0;
++    checkpoint_vblank.valid = true;
++    return src;
++}
++
++bool custom_checkpoint_vblank_finish(void)
++{
++    if (!checkpoint_vblank.valid) return false;
++    bool *flags[11] = {&vb_state, &vb_end_line, &vb_end_next_line, &vb_end_next_line2,
++        &vsync_line, &vsync_rendered, &frame_rendered, &frame_shown, &vsync_display_rendered,
++        &maxvpos_display_vsync_next, &initial_frame};
++    vb_start_line = checkpoint_vblank.start_line;
++    bogusframe = checkpoint_vblank.bogus;
++    maxvpos_display_vsync = checkpoint_vblank.display_vsync;
++    for (int i = 0; i < 11; ++i) *flags[i] = checkpoint_vblank.flags[i];
++    checkpoint_vblank.valid = false;
++    return true;
++}
++#endif
+--- a/ami9000/sources/src/include/savestate.h
++++ b/ami9000/sources/src/include/savestate.h
+@@ -319,3 +319,12 @@
+ extern uae_u8 *restore_libretro_av_checkpoint(uae_u8 *src);
+ extern bool libretro_av_checkpoint_finish(void);
+ #endif
++
++extern bool blitter_checkpoint_cursor_supported(void);
++extern uae_u8 *save_blitter_checkpoint_cursor(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_blitter_checkpoint_cursor(uae_u8 *src);
++extern bool blitter_checkpoint_cursor_finish(void);
++
++extern uae_u8 *save_custom_checkpoint_vblank(size_t *len, uae_u8 *dstptr);
++extern uae_u8 *restore_custom_checkpoint_vblank(uae_u8 *src);
++extern bool custom_checkpoint_vblank_finish(void);
+--- a/ami9000/sources/src/savestate.c
++++ b/ami9000/sources/src/savestate.c
+@@ -745,7 +745,11 @@
+ 			end = restore_custom_extra (chunk);
+ 		else if (!_tcscmp (name, _T("CHPD")))
+ 			end = restore_custom_event_delay (chunk);
+-		else if (!_tcscmp (name, _T("LRAV"))) {
++		else if (!_tcscmp (name, _T("CHVP")))
++            end = restore_custom_checkpoint_vblank(chunk);
++        else if (!_tcscmp (name, _T("BLCU")))
++            end = restore_blitter_checkpoint_cursor(chunk);
++        else if (!_tcscmp (name, _T("LRAV"))) {
+ #ifdef __LIBRETRO__
+             end = restore_libretro_av_checkpoint(chunk);
+ #endif
+@@ -1307,6 +1311,14 @@
+     xfree(dst);
+ #endif
+ 
++    dst = save_custom_checkpoint_vblank(&len, 0);
++    save_chunk(f, dst, len, _T("CHVP"), 0);
++    xfree(dst);
++
++    dst = save_blitter_checkpoint_cursor(&len, 0);
++    save_chunk(f, dst, len, _T("BLCU"), 0);
++    xfree(dst);
++
+     dst = save_custom_checkpoint_bus(&len, 0);
+     save_chunk(f, dst, len, _T("CHBS"), 0);
+     xfree(dst);
+@@ -1372,7 +1384,7 @@
+ 		}
+ 	}
+ #ifdef __LIBRETRO__
+-    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported() || !event_scheduler_checkpoint_supported())
++    if (!custom_event_delay_save_supported() || !custom_checkpoint_timing_supported() || !event_scheduler_checkpoint_supported() || !blitter_checkpoint_cursor_supported())
+         return NULL;
+ #endif
+ 	new_blitter = false;
+--- a/ami9000/libretro/libretro-core.c
++++ b/ami9000/libretro/libretro-core.c
+@@ -9352,7 +9352,7 @@
+     size_t offset = 0;
+     bool cpu_seen = false, ended = false, timing_seen = false;
+     uint32_t expected_pc = 0;
+-    bool av_seen = false;
++    bool av_seen = false, blitter_cursor_seen = false, vblank_seen = false;
+     const uint8_t *scheduler_payload = NULL, *timing_payload = NULL, *bus_payload = NULL;
+     if (!data || size < 12 || memcmp(bytes, "ASF ", 4))
+         return false;
+@@ -9378,6 +9378,16 @@
+                 if (payload[84 + i * 17] > 1) return false;
+             timing_seen = true;
+             timing_payload = payload;
++        }
++        if (!memcmp(chunk, "CHVP", 4)) {
++            if (vblank_seen || payload_size != 27 || e9k_snapshot_be32(payload) != 1) return false;
++            for (unsigned int i = 0; i < 11; ++i) if (payload[16 + i] > 1) return false;
++            vblank_seen = true;
++        }
++        if (!memcmp(chunk, "BLCU", 4)) {
++            if (blitter_cursor_seen || payload_size != 8 || e9k_snapshot_be32(payload) != 1 ||
++                e9k_snapshot_be32(payload + 4) > 272) return false;
++            blitter_cursor_seen = true;
+         }
+         if (!memcmp(chunk, "LRAV", 4)) {
+             if (av_seen || payload_size != 16 || e9k_snapshot_be32(payload) != 1 ||
+@@ -9415,6 +9425,8 @@
+         return false;
+     if (bus_payload && (!timing_payload || !scheduler_payload)) return false;
+     if (av_seen && (!timing_payload || !scheduler_payload || !bus_payload)) return false;
++    if (blitter_cursor_seen && (!timing_payload || !scheduler_payload || !bus_payload || !av_seen)) return false;
++    if (vblank_seen && (!blitter_cursor_seen || !av_seen || !bus_payload || !timing_payload || !scheduler_payload)) return false;
+     libretro_restore_scheduler = scheduler_payload != NULL;
+     libretro_restore_exact = true;
+     bool ok = retro_unserialize(data, size);
+@@ -9424,6 +9436,8 @@
+     if (ok && scheduler_payload) ok = event_scheduler_checkpoint_finish();
+     if (ok && bus_payload) ok = custom_checkpoint_bus_finish();
+     if (ok && av_seen) ok = libretro_av_checkpoint_finish();
++    if (ok && blitter_cursor_seen) ok = blitter_checkpoint_cursor_finish();
++    if (ok && vblank_seen) ok = custom_checkpoint_vblank_finish();
+     uint32_t registers[18];
+     return ok && !savestate_state && e9k_debug_is_paused() &&
+         e9k_debug_read_regs(registers, 18) == 18 && registers[17] == expected_pc;

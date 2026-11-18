@@ -1,0 +1,41 @@
+--- a/ami9000/libretro/e9k_debug.h
++++ b/ami9000/libretro/e9k_debug.h
+@@ -282,3 +282,6 @@
+ void e9k_debug_set_custom_write_observer(void (*observer)(uint32_t, uint32_t, uint32_t, uint32_t));
+ void e9k_debug_observeCustomWrite(uint32_t address, uint32_t value, uint32_t source, uint32_t copper);
+ uint32_t e9k_debug_amiga_get_dmacon(void);
++
++/* Live display latches, independent of the non-serialized custom-write log. */
++uint32_t e9k_debug_amiga_read_display_register(uint32_t reg);
+--- a/ami9000/sources/src/custom.c
++++ b/ami9000/sources/src/custom.c
+@@ -18102,3 +18102,29 @@
+     return true;
+ }
+ #endif
++
++#if E9K_HACK_DEBUGGER_RUNTIME
++#ifdef _WIN32
++__declspec(dllexport)
++#else
++__attribute__((visibility("default")))
++#endif
++uint32_t e9k_debug_amiga_read_display_register(uint32_t reg)
++{
++    if ((reg & 1) || reg > 0x1fe) return 0xffffffffu;
++    if (reg >= 0x180 && reg <= 0x1be)
++        return (uint32_t)current_colors.color_regs_ecs[(reg - 0x180) / 2];
++    switch (reg) {
++    case 0x08e: return (uae_u16)diwstrt;
++    case 0x090: return (uae_u16)diwstop;
++    case 0x092: return (uae_u16)ddfstrt;
++    case 0x094: return (uae_u16)ddfstop;
++    case 0x100: return bplcon0;
++    case 0x102: return bplcon1;
++    case 0x104: return bplcon2;
++    case 0x108: return (uae_u16)bpl1mod;
++    case 0x10a: return (uae_u16)bpl2mod;
++    default: return 0xffffffffu;
++    }
++}
++#endif

@@ -1,0 +1,30 @@
+--- a/ami9000/sources/src/newcpu.c
++++ b/ami9000/sources/src/newcpu.c
+@@ -5138,6 +5138,18 @@
+ #define E9K_RECOMP_EXPORT __attribute__((visibility("default")))
+ #endif
+ static arecomp_original_execute e9k_recomp_executor;
++/* Disabled by default; one read-only host observation before a selected PC. */
++static void (*e9k_pc_observer)(uint32_t, uint32_t);
++static uint32_t e9k_pc_observer_address;
++E9K_RECOMP_EXPORT int e9k_debug_set_pc_observer(uint32_t pc, void (*observer)(uint32_t, uint32_t))
++{
++    if ((pc & 1) || pc > 0xffffffu || !e9k_debug_is_paused())
++        return 0;
++    e9k_pc_observer_address = pc;
++    e9k_pc_observer = observer;
++    return 1;
++}
++
+ static bool e9k_recomp_active;
+ static uint32_t e9k_recomp_bus_clocks;
+ 
+@@ -5333,6 +5345,8 @@
+ #endif
+ 
+ #if E9K_HACK_DEBUGGER_RUNTIME
++                if (e9k_pc_observer && r->instruction_pc == e9k_pc_observer_address)
++                    e9k_pc_observer(r->instruction_pc, (uint32_t)r->opcode);
+                 if (e9k_recomp_executor) {
+                     if (!e9k_recomp_instruction()) { exit = true; continue; }
+                 } else
