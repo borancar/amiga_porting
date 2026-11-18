@@ -7,6 +7,41 @@ description: Method for porting an Amiga game to C (Amiga build plus SDL3/browse
 
 Goal: C source that builds for the Amiga and for SDL3 (desktop, browser) and behaves like the original bytes. The original is the authority at every step; never "fix" something because it looks wrong.
 
+## Layout of a port
+
+The framework repository (amiga-decomp) holds shared tools; each game is `projects/<id>/`, selected explicitly (`python -m amiga_decomp --project <id>`), with no default game and no dependence on another project's layout. Game addresses, names, routines, data, media, reports and game-specific emulator forks belong under the project.
+
+```
+projects/<id>/
+  AGENTS.md  README.md  DECOMPILING.md  PLAN.md  project.json   notes and the method as applied to this game
+  host/        ami9000 Lua scripts (machine description, boot, lockstep, oracle cases)
+  scripts/     generators and test drivers for this game (symbols, struct, amiga.asm, build, rename, lockstep, sweep)
+  local/       git-ignored: Kickstart, original disks, installs, saves
+  captures/    git-ignored: recordings, inputs, RAM dumps (bounded windows, compressed)
+  native/      the reconstruction: its own repository, a submodule of the project
+```
+
+The reconstruction goes under `native/` and is self-contained, so it can be split out and published on its own:
+
+```
+native/
+  README.md  COPYING  .gitignore  .envrc  flake.nix  flake.lock  sdl3-emscripten.nix
+  Makefile                      Amiga build (m68k-amigaos-gcc): intro and game programs; `make sdl`, `make sdl MATCH_MEMORY_LAYOUT=0`
+  src/                          the game in C: game.c, menu.c, boot.c, file.c ..., the state struct and declarations in game.h,
+                                game.symbols (the single source of the variables), data.c and game.ld (generated), the intro's data
+  src/amiga/                    only what the Amiga build has: loader.asm (the only assembly), hardware, display, memory.c
+  src/sdl/                      the SDL3 port of the machine: host, display, irq, sound, files, guest.c / guest_load.c / guest_members.h,
+                                gen_fixups.py, Makefile, Makefile.web, README.md
+  web/                          the browser page (shell.html, assets)
+  scripts/                      what the build needs at run time (e.g. serve_web.py)
+```
+
+Rules:
+- One game module (`game.c`) with address comments, not one file per routine; asm only in the loader.
+- Generated files (`game.h` between its BEGIN/END markers, `data.c`, `game.ld`, `amiga.asm`, fixups) are checked in so the native repository builds alone. The generators and the tests that compare the port with the original live in the project (`projects/<id>/scripts`, `host/`).
+- Original disks, ROMs, recordings and binaries are never part of `native/`; the port asks for the disk images at run time (`--disks DIR`, the page's file picker).
+- License the native repository as the user chooses (`COPYING` in `native/`).
+
 ## 1. Start from the original
 
 - Original disks are never committed. Run the original in an emulator driven by scripts; it is the oracle.
