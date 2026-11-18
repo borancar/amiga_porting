@@ -51,3 +51,20 @@ Emscripten (wasm32, pthreads). The program runs on a worker thread; `emscripten_
 - Build inside the reproducible shell: `flake.nix`, `flake.lock`, `sdl3-emscripten.nix` and `.envrc` (direnv `use flake`, with the retrofoundry cachix cache) in this folder are the reference; copy them into the port's repository and adjust the names (the flake's `GAME_*`/`game.*` names must match the port's Makefiles). It provides the m68k-amigaos-gcc toolchain, SDL3, Emscripten and `nix build .#web`. Run builds with `nix develop --command ...`.
 - Small commits, each with a summary; pushes carry `[skip ci]` where the project asks for it; push only when asked.
 - Framework tools and per-game analysis stay in the framework repository; the port's repository holds the reconstruction and the generated files its build needs.
+
+## 8. The oracle: ami9000 (this repository)
+
+This repository, `git@github.com:borancar/amiga_porting.git`, carries the emulator host every check above runs on. Clone with `--recurse-submodules` (`ami9000/engine9000-src` is the pinned Engine9000/PUAE source). Binaries are never committed; build them:
+
+```
+ami9000/host/build_core.sh     # patched PUAE core -> ami9000/build/system/ami9000.so (patches listed in ami9000/patches/series)
+make -C ami9000/host           # host -> ami9000/build/ami9000_host   (needs SDL3 and Lua 5.4)
+ami9000/build/ami9000_host game.lua [--headless] [the script's own flags]
+```
+
+- A game is one Lua script: `ami.machine{ model, content (adf, .slave or "@blank"), files, roms = {{"kickNNN.rom", crc32}}, opt = {...} }` then `ami.boot()`. Kickstarts and disks are never shipped; keep them in the project's ignored `local/` folder.
+- After `ami.boot()` the script is a coroutine resumed once per core frame: `ami.wait(n)`, `wait_until(fn, max)`, `peek/poke 8/16/32`, `read/write`, `reg/set_reg`, `key`, `pixel/frame_hash/screenshot`, `snapshot_save/load`, `pause/resume`. Hooks run a Lua body when the CPU reaches an address (this is how the per-function oracle calls the original and the C on one state). `ami.import("amiga/lockstep")` is the frame-locked lockstep driver against a native peer (the peer speaks `key`/`step`/`image`/`quit` over stdin/stdout); `amiga/hunk`, `amiga/exec`, `amiga/dos13` load hunk executables and take over Kickstart 1.3 boot.
+- `--control PATH` serves a socket; `ami9000/host/ctl.py PATH 'ami.reg("pc")'` runs Lua lines in the live script, including while it is paused. Use it to inspect a stop.
+- Run it under `ami9000/pidrun.py [--timeout S] -- COMMAND` so it can be waited on, timed out and killed through a pidfd.
+- Full API, flags and the core patches: `ami9000/host/README.md`; how a Lua loader takes over a WHDLoad-style game: `ami9000/WHDLOAD.md`. Each port keeps its own scripts under its project (e.g. `projects/<id>/host/*.lua`), not here.
+- Patches that do not apply to the pinned source (checkpoint, clock, transfer, live-display, pc-observer) are kept in `ami9000/patches/` but are not in `series`.
