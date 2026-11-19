@@ -77,12 +77,23 @@ The same C builds for the big-endian 68000 and the little-endian host, and four 
 ## 4. Verify in layers
 
 1. Oracle per function: hook the original at entry, call original and C on the same machine state, compare the result register and chip RAM. Every function gets a case. Routines that wait for the vertical blank cannot be called with interrupts masked: have the oracle make the waits return at once on both sides (generate the list from the C: the functions that contain `HOST_IDLE`), and put a watchdog on every call (restore the state and report HUNG after some frames, or the first hang silently blocks every later case; each hung call also leaks one of the emulator's eight call slots). The scenarios must really exercise the code: take the savestates where the thing runs (check hit counts of a few routines per 500 frames of a cold run) and press the fire button as the game expects.
-2. Lockstep: replay a recording on the original and on the C build; compare game variables at the top of each loop iteration, plus screenshots. Exclude timing counters. Apply keys by iteration so the replay is deterministic.
+2. Lockstep: run the original and a dev build of the port side by side and compare at the same point of the program (section 4a), memory and picture. Exclude timing counters. Apply keys by sync point so the run is deterministic.
 3. Sweep: run a fixed set of saved states against a stored reference; list known non-equal states in the reference. Never rebuild while a sweep runs.
 4. A/B of build variants: the padded and unpadded builds must produce identical frames and audio. Delete audio dump files first if the writer appends.
 5. Cold start: run the SDL build headless from the first screen with scripted keys and compare its dumps.
 
 Do not skip ahead by poking variables; play the regular run so the state is one the original reaches. Start processes through a pidfd-based runner, not `pkill -f` / `pgrep -f`.
+
+### 4a. Lockstep with a dev build and a control socket
+
+The shipping port stays free of tooling (the port's folder holds only the port); the dev build is a separate target in a folder beside it that compiles the same game C and machine sources plus the control code, and vendored third-party code lives in a top-level `third_party/`.
+
+- **Control by socket.** The dev build serves a control socket (`--control PATH`, as the emulator does), and whatever drives the run connects to it: the emulator's script (a peer), a Python script, a shell one-liner. The protocol is line commands with binary replies: `step N`, `run_until ADDR`, `joy`, `key`, `ram`, `loadram`, `image`, `sync ADDR`, `quit`. The same socket serves interactive inspection of a stop. Prefer this to embedding a scripting language in the port (no interpreter to vendor and build for the game's 32-bit flags, one client library for every language, a paused port can be inspected from outside); a stdin/stdout pipe works for a single peer but cannot be attached to a live run.
+- **The game runs as a coroutine** that yields at each `HOST_IDLE`, so the controller steps the port one frame at a time; `-finstrument-functions` (never on the generated code table) gives hooks by the original's address through the same table that maps addresses to C functions.
+- **Sync points are program points, not instants:** the original takes real cycles and the port none, so compare at an entry of a function the game passes once a frame (the frame-flip routine; hook the entries that jump to it, not a wait loop that jumps to itself). The port starts from the original's memory captured at the game's first instruction.
+- **Baseline of junk:** at the first sync point record which members already differ (what the original's memory held before the game, pointer fields with stale bits) and report only changes after that. Leave out members that depend on interrupt timing (frame counters; with a slow original also the music player and the random generator), as an option.
+- **Picture:** the original's frame one frame after the sync point (the flip takes effect at the next vertical blank) against the port's picture; find the window of the port's picture in the emulator's frame once, by the shift and columns-per-pixel at which the lit pixels coincide. A constant mismatch of the whole picture is an alignment problem, not a game difference: check with the frame before and after.
+- **Frame cadence:** a port stopped inside a hooked function is mid-frame; do not run its frame-end work again on resume, or the port takes extra frames per sync point.
 
 ## 5. The SDL port reimplements only the machine
 
