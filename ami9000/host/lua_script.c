@@ -333,6 +333,24 @@ static int l_snapshot_load(lua_State *s)
     return 1;
 }
 
+/* ami.disk_count(), ami.disk_index() (0-based), ami.disk_eject(bool), ami.disk_select(i): swap floppies of an .m3u;
+ * eject, ami.wait(~20), select, eject(false). nil when the core has no disk control. */
+static int disk_result(lua_State *s, int r)
+{
+    if (r < 0) lua_pushnil(s); else lua_pushinteger(s, r);
+    return 1;
+}
+static int l_disk_count(lua_State *s) { return disk_result(s, api->disk_count ? api->disk_count() : -1); }
+static int l_disk_index(lua_State *s) { return disk_result(s, api->disk_index ? api->disk_index() : -1); }
+static int l_disk_eject(lua_State *s)
+{
+    return disk_result(s, api->disk_eject ? api->disk_eject(lua_toboolean(s, 1)) : -1);
+}
+static int l_disk_select(lua_State *s)
+{
+    return disk_result(s, api->disk_select ? api->disk_select((int)luaL_checkinteger(s, 1)) : -1);
+}
+
 static int l_screenshot(lua_State *s)
 {
     const char *path = luaL_checkstring(s, 1);
@@ -1159,7 +1177,7 @@ static const luaL_Reg funcs[] = {
     {"frame", l_frame}, {"width", l_width}, {"height", l_height},
     {"peek8", l_peek8}, {"peek16", l_peek16}, {"peek32", l_peek32},
     {"poke8", l_poke8}, {"poke16", l_poke16}, {"poke32", l_poke32}, {"read", l_read},
-    {"pixel", l_pixel}, {"frame_hash", l_frame_hash}, {"screenshot", l_screenshot}, {"save_file", l_save_file}, {"append_file", l_append_file}, {"cycles", l_cycles}, {"trace_writes", l_trace_writes}, {"take_writes", l_take_writes}, {"snapshot_save", l_snapshot_save}, {"snapshot_load", l_snapshot_load},
+    {"pixel", l_pixel}, {"frame_hash", l_frame_hash}, {"screenshot", l_screenshot}, {"save_file", l_save_file}, {"append_file", l_append_file}, {"cycles", l_cycles}, {"trace_writes", l_trace_writes}, {"take_writes", l_take_writes}, {"snapshot_save", l_snapshot_save}, {"snapshot_load", l_snapshot_load}, {"disk_count", l_disk_count}, {"disk_index", l_disk_index}, {"disk_eject", l_disk_eject}, {"disk_select", l_disk_select},
     {"key", l_key}, {"joystick", l_joystick}, {"mouse_move", l_mouse_move}, {"mouse_button", l_mouse_button},
     {"log", l_log}, {"quit", l_quit}, {"wait", l_wait}, {"wait_until", l_wait_until},
     {"peer", l_peer}, {"input", l_input}, {"panel", l_panel}, {"frame_rgb", l_frame_rgb}, {"rgb_diff", l_rgb_diff}, {"call", l_call}, {"pause", l_pause}, {"resume", l_resume}, {"paused", l_paused}, {"custom", l_custom}, {"step", l_step}, {"reg", l_reg}, {"set_reg", l_set_reg}, {"hook", l_hook}, {"unhook", l_unhook}, {"rts", l_rts},

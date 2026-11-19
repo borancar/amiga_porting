@@ -211,6 +211,17 @@ static void core_hook(uint32_t pc)
     if (script_path) lua_script_breakpoint(&host_api, pc);
 }
 
+/* Floppy changes: the core's disk control interface (set by the core while it loads an .m3u). */
+static struct retro_disk_control_callback disk_control;
+static bool have_disk_control;
+static int disk_phase; /* hotkey cycle: frames left before the next image goes in, 0 when idle */
+static int disk_next;
+
+static int api_disk_count(void) { return have_disk_control ? (int)disk_control.get_num_images() : -1; }
+static int api_disk_index(void) { return have_disk_control ? (int)disk_control.get_image_index() : -1; }
+static int api_disk_eject(int eject) { return have_disk_control ? disk_control.set_eject_state(eject != 0) : -1; }
+static int api_disk_select(int index) { return have_disk_control ? disk_control.set_image_index((unsigned)index) : -1; }
+
 /* Snapshots: the core's own savestate. The F11 hotkey only sets a request (it arrives inside retro_run); the main loop
  * serves it between frames. Restoring is for scripts (ami.snapshot_load). */
 static const char *snapshot_dir;
@@ -430,8 +441,11 @@ static bool environment(unsigned cmd, void *data)
     case RETRO_ENVIRONMENT_SET_GEOMETRY:
     case RETRO_ENVIRONMENT_SET_ROTATION:
     case RETRO_ENVIRONMENT_SET_MESSAGE:
+        return true;
     case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
-    case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE:
+    case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE: /* starts with the same members */
+        disk_control = *(struct retro_disk_control_callback *)data;
+        have_disk_control = true;
         return true;
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
         pixel_format = *(enum retro_pixel_format *)data;
@@ -691,6 +705,16 @@ static void input_poll(void)
             bool down = event.type == SDL_EVENT_KEY_DOWN;
             if (down && event.key.key == SDLK_F11) {
                 snapshot_request = 1; /* captured between frames; scripts restore with ami.snapshot_load */
+                break;
+            }
+            if (down && event.key.key == SDLK_PAGEDOWN && have_disk_control && !disk_phase) {
+                int count = api_disk_count();
+                if (count > 1) { /* next image: out for 50 frames, then in */
+                    disk_next = (api_disk_index() + 1) % count;
+                    api_disk_eject(1);
+                    disk_phase = 50;
+                    fprintf(stderr, "ami9000_host: disk ejected, inserting image %d of %d\n", disk_next + 1, count);
+                }
                 break;
             }
             if (down && event.key.key == SDLK_F12) {
@@ -985,7 +1009,9 @@ int main(int argc, char **argv)
             .read_regs = api_read_regs, .write_reg = api_write_reg, .pause = api_pause, .resume = api_resume,
             .is_paused = api_is_paused, .custom_write = api_custom_write, .take_input = api_take_input,
             .panel = api_panel, .snapshot_save = api_snapshot_save, .snapshot_load = api_snapshot_load,
-            .read_cycles = api_read_cycles, .trace_writes = api_trace_writes, .take_writes = api_take_writes};
+            .read_cycles = api_read_cycles, .trace_writes = api_trace_writes, .take_writes = api_take_writes,
+            .disk_count = api_disk_count, .disk_index = api_disk_index,
+            .disk_eject = api_disk_eject, .disk_select = api_disk_select};
         e9k_set_hook_callback(core_hook);
     }
     if (plugin_path) {
@@ -1037,6 +1063,10 @@ int main(int argc, char **argv)
         if (snapshot_request) {
             api_snapshot_save(NULL);
             snapshot_request = 0;
+        }
+        if (disk_phase && --disk_phase == 0) {
+            api_disk_select(disk_next);
+            api_disk_eject(0);
         }
         if (plugin && plugin->before_frame) plugin->before_frame(&host_api);
         if (script_path) {

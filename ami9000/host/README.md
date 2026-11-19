@@ -64,6 +64,7 @@ only act through `ami`.
 | `reg(name)`, `set_reg(name, v)` | `d0`-`d7`, `a0`-`a7` (`sp`), `sr`, `pc` |
 | `custom(offset)` | last value written to a custom register (`$096` is DMACON) and the PC that wrote it |
 | `pixel(x, y)`, `frame_hash([x, y, w, h])`, `screenshot(path)` | last frame as `0xAARRGGBB`; FNV-1a hash; PPM |
+| `disk_count()`, `disk_index()`, `disk_eject(bool)`, `disk_select(i)` | swap floppies of an `.m3u` content (first image in DF0; the core's disk control): `disk_eject(true); wait(20); disk_select(1); disk_eject(false)`. In the window **PageDown** does that for the next image. nil without disk control |
 | `snapshot_save([name])`, `snapshot_load(name)` | the machine's whole state (the core's savestate) to or from a file; a name without `/` is a file in the machine's `snapshots` directory (`--snapshots DIR`; default the save directory), and `snapshot_save()` with no name writes `frame-N.state`. Returns whether it worked. In the window **F11 captures** `frame-N.state` the same way (between frames); restoring is the script's job. Restoring does not rewind a lockstep peer |
 | `save_file(path, bytes)` | writes a host file, creating parent directories (memory snapshots: `save_file(p, ami.read(0, 0x80000))`) |
 | `key(k, down)` | `k` is a libretro key code or a name from `ami.keys` (`"return"`, `"a"`, `"kp_multiply"`, `"f1"`...) |
@@ -143,7 +144,7 @@ Stopping the machine is separate and explicit: `ami.pause()` freezes it (silent,
 pauses and single-steps, calling `fn(pc)` before each instruction until it returns something other than `true`,
 then resumes (slow, and the frames are cut short: for debugging).
 
-Limits: a hook is skipped once at the PC a paused machine resumes at; hooks are per address, not per task.
+Limits: a hook is skipped once at the PC a paused machine resumes at; hooks are per address, not per task, and `ami.hook(a, f)` replaces any hook already at `a`. While the machine free-runs the reported address is sometimes two bytes before the instruction (and extension words report too): for an exact trace use `ami.step`, whose callback gets the true address of each instruction (`host/trace_steps.lua` of a port records counts, frames and successors; about 30,000 steps a second). A script's main chunk ending does not stop the host: finish with `ami.quit()`.
 
 ## Shared Lua modules (`lua/`)
 

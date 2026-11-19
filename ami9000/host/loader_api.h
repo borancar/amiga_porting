@@ -84,6 +84,15 @@ typedef struct ami_host_api {
      * and _B (the fire button); the state stays until the next call. Appended after take_writes: a loader built
      * earlier never reads it. */
     void (*joystick)(unsigned mask);
+    /* Floppy changes through the core's disk control (a multi-disk .m3u loads every image; the first is in DF0):
+     * disk_count and disk_index; disk_eject(1) takes the disk out of DF0, disk_eject(0) puts the selected one in;
+     * disk_select(i) picks image i while ejected. A drive that sees no disk change needs a few frames between
+     * eject and insert. Between frames, never from a hook. Return 0 / -1 when the core has no disk control.
+     * Appended after joystick: a loader built earlier never reads them. */
+    int (*disk_count)(void);
+    int (*disk_index)(void);
+    int (*disk_eject)(int eject);
+    int (*disk_select)(int index);
 } ami_host_api;
 
 typedef struct ami_loader {

@@ -46,6 +46,9 @@ Rules:
 
 - Original disks are never committed. Run the original in an emulator driven by scripts; it is the oracle.
 - Reconstruct executed code only (coverage of scripted and human runs). A branch to code that never ran ends the C function with `/* goes on at $ADDR */`; fill it in when a later run reaches it.
+- The executed code comes from an **exact trace**, not from hooks: the core's hooks report an address that is sometimes two bytes off while the machine free-runs (the prefetch), a hook on an extension word fires too, and `ami.hook` keeps one function per address (a coverage hook silently replaces your control hook). Free-run to the frame you care about, then `ami.step(fn)` (exact instruction addresses; about 30,000 steps a second) recording each address, its count, the frames it first and last ran and its observed successors (successors expose interrupt entries and indirect jumps). Do the inputs of the run from the step callback by frame number so the run is the same one.
+- The low RAM is overlaid by programs (the intro, the game, a level's code): record the first frame of every instruction and take RAM dumps at several frames; decode each address from the dump of its phase. Find where a program image comes from on disk by searching the ADF for a block of the RAM dump.
+- Python tooling runs through `uv` (`uv run script.py`, dependencies declared in the script's PEP 723 header or the project's `pyproject.toml`), never a global `pip install`. Read the original with capstone (`Cs(CS_ARCH_M68K, CS_MODE_M68K_000)`) on a RAM dump taken at the moment the code runs, with the coverage marking which instructions executed: disassemble, then write the C by hand from that listing. Code loaded by the game's own loader overwrites earlier code, so dump RAM after it is in place.
 - Every function carries `/* orig $ADDR: what it does */`. Name by what the code does; a provisional name is `fn_` plus the address.
 
 ## 2. Variables are one struct
@@ -63,9 +66,17 @@ Rules:
 - Convert endianness only where data enters from disk or a memory image, never in game logic.
 - Amiga-specific code lives in its own directory; the SDL port reimplements it.
 
+### Hazards of running the C on a little-endian host
+
+The same C builds for the big-endian 68000 and the little-endian host, and four things only go wrong on the host (the oracle on the Amiga build cannot see them; run the port headless with a scripted input and look at game variables, e.g. the positions of the enemies and the score):
+- A raw byte buffer (screens, graphics, sector buffers, level data) holds the original's byte order: read and write its words and longs only through `rd16/rd32/wr16/wr32`; typed members are in host order.
+- A long that overlays two words in another view of the same record (a 16.16 position used as a long by one routine and as two words by the others) is wrong on the host: declare it as the pair of words, high word first, and compose it in the one routine.
+- An address of the original's code stored in memory (a handler, an animation op) is turned into the C function through one generated table, in the Amiga build too (never the identity: it would jump into the original's machine code); in the host build an address with no C is a logging stub.
+- Loops that wait for an interrupt or the beam call `HOST_IDLE()`; the beam registers (`vposr`, `vhposr`) are given values that put the beam in the vertical blank; the disk HLE takes emulated frames (the game's retry loops count them).
+
 ## 4. Verify in layers
 
-1. Oracle per function: hook the original at entry, call original and C on the same machine state, compare the result register and chip RAM. Every function gets a case.
+1. Oracle per function: hook the original at entry, call original and C on the same machine state, compare the result register and chip RAM. Every function gets a case. Routines that wait for the vertical blank cannot be called with interrupts masked: have the oracle make the waits return at once on both sides (generate the list from the C: the functions that contain `HOST_IDLE`), and put a watchdog on every call (restore the state and report HUNG after some frames, or the first hang silently blocks every later case; each hung call also leaks one of the emulator's eight call slots). The scenarios must really exercise the code: take the savestates where the thing runs (check hit counts of a few routines per 500 frames of a cold run) and press the fire button as the game expects.
 2. Lockstep: replay a recording on the original and on the C build; compare game variables at the top of each loop iteration, plus screenshots. Exclude timing counters. Apply keys by iteration so the replay is deterministic.
 3. Sweep: run a fixed set of saved states against a stored reference; list known non-equal states in the reference. Never rebuild while a sweep runs.
 4. A/B of build variants: the padded and unpadded builds must produce identical frames and audio. Delete audio dump files first if the writer appends.
@@ -76,6 +87,8 @@ Do not skip ahead by poking variables; play the regular run so the state is one 
 ## 5. The SDL port reimplements only the machine
 
 Display, copper, blitter, interrupts, sound mixer, disk access and the memory image are the port's. Game files load member by member through a member table, with generated fixups for structs inside disk records. The Amiga build has no libc: supply `memset`/`memcpy` yourself (and keep the compiler from turning their loops into calls to themselves).
+
+High-level emulation, not chip emulation: no beam, no DMA slots, no chip timing. The C that drives a chip stays faithful (it runs on the Amiga and in the oracle) and the few registers whose write starts an action go through one macro each that the port intercepts: `BLTSIZE_WRITE` (the host performs the whole blit at once from the registers: area mode with shifts, masks, minterm and modulos; the blitter is never busy) and `SETCLR_WRITE` for the set/clear registers (`dmacon`, `intena`, `intreq`). A routine that is better replaced as a whole (the game's disk loader, a chip delay loop) is declared `HLE_WEAK` and the port links a strong definition over it. The picture is made once a frame from the registers the CPU set and the copper list the game leaves in memory, read as data (MOVE and WAIT per scanline). Sound is a mixer fed from the channel registers (lc, len, per, vol, DMACON). Waits for an interrupt are written `while (!flag) HOST_IDLE();`: the host runs the due interrupts there, one video frame of emulated time per call. Where the picture cannot be derived this way, the oracle layers (section 4) compare frames. Gods (`src/sdl/display.c`) and Xenon 2 (`src/sdl/display.c`, `blitter.c`, `sound.c`, `disk.c`) are references.
 
 ## 6. Browser build
 
@@ -88,6 +101,8 @@ Emscripten (wasm32, pthreads). The program runs on a worker thread; `emscripten_
 - Framework tools and per-game analysis stay in the framework repository; the port's repository holds the reconstruction and the generated files its build needs.
 
 ## 8. The oracle: ami9000 (this repository)
+
+Multi-disk games and runtime checks: `content` can be an `.m3u` (the first image in DF0); `ami.disk_count/index/eject/select` swap floppies (eject, wait ~20 frames, select, insert; a savestate restores disk 1 again, so scripts that load a disk-2 level start from a cold boot or swap after the load). A host script ends with `ami.quit()`, or the process runs until its timeout.
 
 This repository, `git@github.com:borancar/amiga_porting.git`, carries the emulator host every check above runs on. Clone with `--recurse-submodules` (`ami9000/engine9000-src` is the pinned Engine9000/PUAE source). Binaries are never committed; build them:
 

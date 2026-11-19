@@ -198,6 +198,18 @@ function ami.save_file(path, bytes) end
 ---@param path? string
 ---@return boolean
 function ami.snapshot_save(path) end
+
+---Floppy changes for an .m3u content (the first image is in DF0). Swap with eject, a few frames, select, insert:
+---`ami.disk_eject(true); ami.wait(20); ami.disk_select(1); ami.disk_eject(false)`. In the window PageDown cycles to the next image
+---the same way. The functions return nil when the core has no disk control. Not from a hook.
+---@return integer?
+function ami.disk_count() end
+---@return integer? 0-based index of the selected image
+function ami.disk_index() end
+---@param eject boolean
+function ami.disk_eject(eject) end
+---@param index integer 0-based
+function ami.disk_select(index) end
 ---@param path? string
 ---@return boolean
 function ami.snapshot_load(path) end
