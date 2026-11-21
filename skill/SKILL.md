@@ -38,6 +38,7 @@ native/
 
 Rules:
 - One game module (`game.c`) with address comments, not one file per routine; asm only in the loader.
+- The shipping port has no test or debugging options: its command line is the user's (`--disks`, `--scale`, the renderer). Headless runs, frame limits, picture hashes and dumps, scripted input, memory exports and status prints belong to the dev build (`dev/`, driven from Lua), which sets the one thing it needs from the machine (`host_set_headless`) before the machine starts. A test flag added to the port's `main.c` for a first check is moved to the dev build the day the dev build exists.
 - Generated files (`game.h` between its BEGIN/END markers, `data.c`, `game.ld`, `amiga.asm`, fixups) are checked in so the native repository builds alone. The generators and the tests that compare the port with the original live in the project (`projects/<id>/scripts`, `host/`).
 - Original disks, ROMs, recordings and binaries are never part of `native/`; the port asks for the disk images at run time (`--disks DIR`, the page's file picker).
 - License the native repository as the user chooses (`COPYING` in `native/`).
