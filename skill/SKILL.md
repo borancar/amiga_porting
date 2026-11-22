@@ -85,6 +85,15 @@ The same C builds for the big-endian 68000 and the little-endian host, and four 
 - An address of the original's code stored in memory (a handler, an animation op) is turned into the C function through one generated table, in the Amiga build too (never the identity: it would jump into the original's machine code); in the host build an address with no C is a logging stub.
 - Loops that wait for an interrupt or the beam call `HOST_IDLE()`; the beam registers (`vposr`, `vhposr`) are given values that put the beam in the vertical blank; the disk HLE takes emulated frames (the game's retry loops count them).
 
+### No addresses in the game code
+
+Typed members and positions replace every address and offset, so the port holds no number that is a place in the original's memory:
+- Words of pictures, masks, cells, screens and animation scripts are `uint16_t` members (a pointer to them is `const uint16_t *`); the loader swaps them, the game code never does. Bytes written into a word buffer (`put_screen_byte`) pick the half of the word by the byte's parity.
+- A screen, the map or a scratch area is addressed by position: `SCREEN_POS(screen, row, col)`, `MAP_ROW/MAP_CELL`, and a struct laid over a buffer that the game reuses (a disk work area over a screen) is cast over it. A table index that the original kept as a byte offset in a local is an index (`angle >> 5`, not `(angle >> 3) & 0x1c` then `/ 4`); an offset the game stores in an object field stays, it is state.
+- Addresses inside data are typed fields: an animation step is `{ const uint16_t *gfx; uint16_t delay; }`, a call `{ zero, code }`, a jump `{ script }`; the loader walks the scripts (start points: members named anim, targets of pointer members named anim) and makes the longs pointers, the saver puts the addresses back. Memory the original reads past its end is a member (`beyond_512k`).
+- A pointer that shares its words with another field (a long whose second word is also an energy) is a pointer only if the other field is never written while it is live; a stale value in a freed slot then differs from the original's and the lockstep comparison must leave that slot out.
+- Pointer arithmetic after a retype from bytes to words changes scale silently: audit every `+=`, `-=` and index of a retyped pointer.
+
 ## 4. Verify in layers
 
 1. Oracle per function: hook the original at entry, call original and C on the same machine state, compare the result register and chip RAM. Every function gets a case. Routines that wait for the vertical blank cannot be called with interrupts masked: have the oracle make the waits return at once on both sides (generate the list from the C: the functions that contain `HOST_IDLE`), and put a watchdog on every call (restore the state and report HUNG after some frames, or the first hang silently blocks every later case; each hung call also leaks one of the emulator's eight call slots). The scenarios must really exercise the code: take the savestates where the thing runs (check hit counts of a few routines per 500 frames of a cold run) and press the fire button as the game expects.
