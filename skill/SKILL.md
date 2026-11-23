@@ -27,11 +27,13 @@ The reconstruction goes under `native/` and is self-contained, so it can be spli
 native/
   README.md  COPYING  .gitignore  .envrc  flake.nix  flake.lock  sdl3-emscripten.nix
   Makefile                      Amiga build (m68k-amigaos-gcc): intro and game programs; `make sdl`
+  Makefile.web                  the browser build (Emscripten), at the top of native/, not in src/sdl/
+  .github/workflows/web.yml     builds `nix build .#web` and deploys it to Pages on pushes to master
   src/                          the game in C: game.c, menu.c, boot.c, file.c ..., the state struct and declarations in game.h,
                                 game.symbols (the single source of the variables), data.c and game.ld (generated), the intro's data
   src/amiga/                    only what the Amiga build has: loader.asm (the only assembly), hardware, display, memory.c, and the code that drives a chip the port replaces as a whole (the drive: disk.c)
   src/sdl/                      the SDL3 port of the machine: host, display, irq, sound, files, guest.c / guest_load.c / guest_members.h,
-                                gen_fixups.py, Makefile, Makefile.web, README.md
+                                gen_fixups.py, README.md
   web/                          the browser page (shell.html, assets)
   scripts/                      what the build needs at run time (e.g. serve_web.py)
 ```
@@ -168,7 +170,18 @@ High-level emulation, not chip emulation: no beam, no DMA slots, no chip timing.
 
 ## 6. Browser build
 
-Emscripten (wasm32, pthreads). The program runs on a worker thread; `emscripten_set_main_loop` does vblank, drawing and sound; disk images go to the in-memory file system from the page; persistent data uses IDBFS; a phase switch joins the worker and starts the next phase. Turn the renderer's vsync on, or SDL runs the main loop on a timer. Serve with a script that sets the cross-origin-isolation headers threads need.
+Emscripten, wasm32 (4-byte pointers, as the 68000's: the game's structs and `-fpack-struct=2` carry over). `Makefile.web` at the top of `native/` builds `xenon2.html`, `.js`, `.wasm` into `build/web`; `nix build .#web` does the same in the sandbox (`XENON2_NO_NIX=1`, `SDL3_PREFIX` = the flake's `sdl3-emscripten`, `W` = output folder) and writes `index.html` (a copy of the game page), the assets and `scripts/serve_web.py` into `result`. The page (`web/shell.html`) takes the two disk images (drop or choose), writes them into the in-memory file system, then `Module.callMain(['--disks', '/'])`; link with `-sINVOKE_RUN=0 -sFORCE_FILESYSTEM=1 -sEXPORTED_RUNTIME_METHODS=['FS','callMain']`.
+
+Two ways to run the program, by how the port is shaped:
+- **The game is the main loop, the machine is called from it** (`host_idle()` at each wait for the frame; Xenon 2): no thread. Link with `-sASYNCIFY`; where the host waits for the clock, call `emscripten_sleep(ms)` (the game's stack is parked and the browser runs: events, audio, the canvas present), instead of `SDL_DelayNS`. No worker, no `-pthread` (also not in `sdl3-emscripten.nix`), no cross-origin isolation, no `coi-serviceworker`; the page is served by any static server. Costs size and some speed: check it holds the frame rate. In the video setup use the browser's driver (no driver list).
+- **A program that runs on its own and a host thread around it** (Gods: the intro, the menu and the game are programs that start one another): the program runs on a pthread (a web worker), `emscripten_set_main_loop` does vblank, drawing and sound, a phase switch joins the worker and starts the next one; needs `-pthread`, SDL built with `-pthread`, cross-origin isolation (`coi-serviceworker.js` in the page, or the headers) and a serve script that sets them.
+Persistent data (hi-scores, if the game writes any) goes to IDBFS mounted on a folder the page makes and `syncfs`es; a game that writes nothing needs none. Turn the renderer's vsync on only where the host is not pacing frames itself.
+
+What the web build needs in the repository, because `native/` is published alone (a `git subtree split --prefix=native` to `master`, where the workflow runs) and cannot run the framework's `tools/`: every generated source the SDL build compiles is **tracked**, not ignored (the member table `guest_members.h`, the records loader `sdl/records.c`, the code table, the stub file); regenerate and commit them when the symbols change. A flake only sees tracked files: `git add` new files (`Makefile.web`, `web/`, the generated sources) before `nix build`, or the build fails with "No rule to make target".
+
+Workflow (copy Gods': `cachix/install-nix-action`, `cachix/cachix-action` with the `retrofoundry` cache, `nix build .#web`, `configure-pages`, `upload-pages-artifact` with `result`, `deploy-pages`): `on: push: branches: [master]` only, no manual trigger; it needs the `CACHIX_AUTH_TOKEN` secret and Pages set to the "GitHub Actions" source.
+
+A `Makefile.web` beside `Makefile` makes GNU make try to rebuild `Makefile` through its built-in `Makefile.web` -> `Makefile.p` (tangle) chain: put `MAKEFLAGS += -r` and `Makefile: ;` at the top of `Makefile`.
 
 ## 7. Working rules
 
