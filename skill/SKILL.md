@@ -25,7 +25,7 @@ The reconstruction goes under `native/` and is self-contained, so it can be spli
 
 ```
 native/
-  README.md  COPYING  .gitignore  .envrc  flake.nix  flake.lock  sdl3-emscripten.nix
+  README.md  LICENSE  .gitignore  .envrc  flake.nix  flake.lock  sdl3-emscripten.nix
   Makefile                      Amiga build (m68k-amigaos-gcc): intro and game programs; `make sdl`
   Makefile.web                  the browser build (Emscripten), at the top of native/, not in src/sdl/
   .github/workflows/web.yml     builds `nix build .#web` and deploys it to Pages on pushes to master
@@ -187,6 +187,7 @@ A `Makefile.web` beside `Makefile` makes GNU make try to rebuild `Makefile` thro
 
 - Build inside the reproducible shell: `flake.nix`, `flake.lock`, `sdl3-emscripten.nix` and `.envrc` (direnv `use flake`, with the retrofoundry cachix cache) in this folder are the reference; copy them into the port's repository and adjust the names (the flake's `GAME_*`/`game.*` names must match the port's Makefiles). It provides the m68k-amigaos-gcc toolchain, SDL3, Emscripten and `nix build .#web`. Run builds with `nix develop --command ...`.
 - **Check a refactor against the build before it.** Make a `git worktree` of the commit before the move, build both, and run the same plays (the menu, the shop, several levels from `exercise.lua`, the idle lockstep) on each: identical picture hashes mean only code moved. A difference that the same run shows on both sides (a lockstep that stops after a few syncs) is not yours.
+- **License: all the work is GPLv2.** The project root and `native/` each carry `LICENSE` (the GPLv2 text), and each `README.md` says the work is licensed under the GNU GPL version 2 or (at your option) any later version. The published branch is `git subtree split --prefix=native`, so `native/LICENSE` and `native/README.md` are what the published repository shows: both must be there before a split is pushed. Third-party code keeps its own license file beside it (named in the README); the disk images, Kickstart and other original material are not part of the work and are never committed.
 - Small commits, each with a summary; pushes carry `[skip ci]` where the project asks for it; push only when asked.
 - Name every local and parameter for what it holds (`obj`, `shot`, `x`, `angle`, `count`), not for the register it was in (`a0`, `d0`); parameter names in a prototype equal those of the definition. Where one register held two things, give each its own declaration of the same type, with no change of casts, widths or statement order; list the functions you split in the commit message, because a lockstep proves them only on the paths it reaches.
 - A naming pass over many files can be run in parallel by file: each agent edits only its own files, runs no build, and checks them with `gcc -fsyntax-only`; one full build and the lockstep follow. Do not let agents share a scratch script path: two overwrote each other's.
